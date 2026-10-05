@@ -199,6 +199,54 @@ statements that broader configuration can override.
 See the [policies guide](/policies) for matching, precedence across configuration
 files, and Console-managed policy.
 
+### Model routes
+
+Define ordered provider/model pools under `experimental.model_routes`. Select a
+route like any other model using `opencode-route/<route-id>`. If a target fails
+before producing output, OpenCode tries the next healthy target. It never
+replays a turn after answer or tool output has started.
+
+```jsonc
+{
+  "experimental": {
+    "model_routes": {
+      "cheap-fast": {
+        "name": "Cheap / fast",
+        "targets": ["openai/gpt-6-luna", "github-copilot/gpt-6-luna"],
+        "health": {
+          "firstTokenTimeoutMs": 10000,
+          "maxResponseTimeMs": 45000,
+          "sampleWindow": 5,
+          "slowThreshold": 3,
+          "cooldownMs": 60000,
+        },
+      },
+      "smart-slow": {
+        "targets": ["anthropic/claude-opus-5", "openrouter/claude-opus-5"],
+      },
+      "frontier-heavy": {
+        "targets": ["openai/gpt-6-astra", "anthropic/claude-opus-5"],
+      },
+    },
+  },
+}
+```
+
+Targets are tried in order. Each route defaults to a 10-second first-output
+deadline, degradation after 3 slow completions in a rolling window of 5, and a
+60-second in-memory cooldown. Set `firstTokenTimeoutMs` to `false` to disable
+that deadline. Optional `maxResponseTimeMs` and `minOutputTokensPerSecond`
+thresholds define a slow completed response; omitting both leaves the first
+output deadline as the only performance signal. Cooldowns are local to the
+OpenCode process and are not persisted. A route can reference another route,
+and a requested variant is offered only when every target supports it.
+Provider-use policies still apply to the concrete targets; a route only exposes
+models that remain available after those policies run.
+
+Use `opencode-route/cheap-fast`, `opencode-route/smart-slow`, or
+`opencode-route/frontier-heavy` as a category model in OpenChamber's Auto
+routing settings to compose `Auto → Jev category/agent → provider pool`.
+
 ### Agents
 
 Override built-in agents or define specialized agents with their own model,

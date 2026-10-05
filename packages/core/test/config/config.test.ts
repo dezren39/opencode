@@ -655,6 +655,29 @@ describe("Config", () => {
     expect(migrateV1({ experimental: { subagent_depth: 2 } }).experimental?.subagent_depth).toBe(2)
   })
 
+  test("normalizes ordered model routes inside experimental config", () => {
+    const migrated = migrateV1({
+      experimental: {
+        model_routes: {
+          "cheap-fast": {
+            name: "Cheap / fast",
+            targets: ["openai/gpt-6-luna", "github-copilot/gpt-6-luna"],
+            health: { maxResponseTimeMs: 45_000 },
+          },
+        },
+      },
+    })
+
+    expect(migrated.experimental?.model_routes?.["cheap-fast"]).toMatchObject({
+      name: "Cheap / fast",
+      targets: [
+        { providerID: "openai", model: "gpt-6-luna" },
+        { providerID: "github-copilot", model: "gpt-6-luna" },
+      ],
+      health: { maxResponseTimeMs: 45_000 },
+    })
+  })
+
   test("migrates the v1 update policy", () => {
     expect(migrateV1({ autoupdate: false }).update).toBe("disable")
     expect(migrateV1({ autoupdate: "notify" }).update).toBe("notify")

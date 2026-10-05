@@ -15,7 +15,12 @@ export type Info = SessionProviderContext.Info
 const messages = Schema.toCodecJson(Schema.Array(Message))
 
 /** No guessed endpoints. Dynamic URL builders cannot establish a durable deployment identity here. */
-export function provenance(resolved: Pick<SessionRunnerModel.Resolved, "model" | "ref">): Provenance | undefined {
+export function provenance(
+  resolved: Pick<SessionRunnerModel.Resolved, "model" | "ref" | "routing">,
+): Provenance | undefined {
+  // A routed model may switch providers between turns. Native checkpoints are opaque to the
+  // fallback target, so route sessions use the normal transcript path instead.
+  if (resolved.routing) return undefined
   const model = resolved.model
   const endpoint = model.route.endpoint
   if (!endpoint.baseURL || typeof endpoint.path !== "string") return undefined

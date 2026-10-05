@@ -6,11 +6,13 @@ import {
   LLMClient,
   LLMEvent,
   isContextOverflowFailure,
+  TransportError,
+  UnknownProviderError,
   type ProviderErrorEvent,
   type ToolCall,
 } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
-import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Clock, Data, Deferred, Duration, Effect, Exit, Fiber, Option, Result, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 import { Bus } from "../../bus.js"
 import { Permission } from "../../permission.js"
@@ -25,6 +27,7 @@ import { SessionModelRequest } from "../model-request.js"
 import { SessionSchema } from "../schema.js"
 import { toSessionError } from "../to-session-error.js"
 import { SessionUsage } from "../usage.js"
+import { ModelRoute } from "../../model-route.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
 import { SessionRunnerRetry } from "./retry.js"
@@ -32,6 +35,7 @@ import { SessionRunnerRetry } from "./retry.js"
 export type Outcome = Data.TaggedEnum<{
   Completed: { readonly needsContinuation: boolean }
   Retry: { readonly error: SessionError.Error; readonly decision: SessionRunnerRetry.Decision }
+  Failover: { readonly model: SessionRunnerModel.Resolved; readonly error: SessionError.Error }
   Continue: {
     readonly error: SessionError.Error
     readonly decision: SessionRunnerRetry.Decision
@@ -71,6 +75,8 @@ export const make = Effect.gen(function* () {
 
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
     const startSnapshot = yield* snapshots.capture()
+    const requestStarted = performance.now()
+    const firstOutput = yield* Deferred.make<void>()
     const publisher = createLLMEventPublisher(bus, {
       sessionID: input.sessionID,
       assistantMessageID: input.assistantMessageID,
@@ -79,6 +85,7 @@ export const make = Effect.gen(function* () {
       providerMetadataKey: input.model.model.route.providerMetadataKey ?? input.model.model.provider,
       snapshot: startSnapshot,
       started: yield* Clock.currentTimeMillis,
+      deferStepStart: input.model.routing !== undefined,
     })
     const toolRuns: Array<{
       readonly call: ToolCall
@@ -100,11 +107,13 @@ export const make = Effect.gen(function* () {
     // Provider and tool fibers retain per-source order without a shared writer queue.
     // A local execution starts only after its Tool.Called publication completes.
     let overflowFailure: ProviderErrorEvent | undefined
+    let providerFailure: ProviderErrorEvent | undefined
+    let firstOutputAt: number | undefined
     // Read to the end, not just the finish event, so the next request can reuse this response.
     const providerStream = llm.stream(input.prepared.request, input.prepared.options).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
-          if (overflowFailure || publisher.hasProviderError()) return
+          if (overflowFailure || providerFailure || publisher.hasProviderError()) return
           if (
             LLMEvent.is.providerError(event) &&
             isContextOverflowFailure(event) &&
@@ -113,7 +122,20 @@ export const make = Effect.gen(function* () {
             overflowFailure = event
             return
           }
+          const outputAlreadyStarted = publisher.record().outputStarted
+          if (LLMEvent.is.providerError(event) && input.model.routing) {
+            if (!outputAlreadyStarted) {
+              providerFailure = event
+              return
+            }
+            if (!event.classification) ModelRoute.failed(input.model.routing.target, input.model.routing.policy)
+          }
+          const receivedAt = performance.now()
           yield* publisher.publish(event)
+          if (!outputAlreadyStarted && publisher.record().outputStarted && firstOutputAt === undefined) {
+            firstOutputAt = receivedAt
+            yield* Deferred.succeed(firstOutput, undefined)
+          }
           if (event.type !== "tool-call" || event.providerExecuted) return
           toolRuns.push({
             call: event,
@@ -135,7 +157,40 @@ export const make = Effect.gen(function* () {
     // Keep the final tool and Step events uninterruptible, even when the work itself is cancelled.
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
-        const stream = yield* restore(providerStream).pipe(Effect.exit)
+        const firstTokenTimeout = input.model.routing?.policy.firstTokenTimeoutMs
+        let stream: Exit.Exit<void, AIError>
+        if (typeof firstTokenTimeout !== "number") {
+          // Keep the established execution and interruption path unchanged for ordinary models
+          // and routes that explicitly disable the first-output deadline.
+          stream = yield* restore(providerStream).pipe(Effect.exit)
+        } else {
+          const streamFiber = yield* Effect.forkScoped(Effect.exit(restore(providerStream)))
+          const timedOut = yield* restore(
+            Effect.raceFirst(
+              Deferred.await(firstOutput).pipe(Effect.as(false)),
+              Effect.raceFirst(
+                Fiber.await(streamFiber).pipe(Effect.as(false)),
+                Effect.sleep(Duration.millis(firstTokenTimeout)).pipe(Effect.as(true)),
+              ),
+            ),
+          )
+          stream = timedOut
+            ? yield* Fiber.interrupt(streamFiber).pipe(
+                Effect.as(
+                  Exit.fail(
+                    new AIError({
+                      reason: new TransportError({
+                        message: `No response output within ${firstTokenTimeout}ms`,
+                        transport: "http",
+                        operation: "request",
+                        code: "Timeout",
+                      }),
+                    }),
+                  ),
+                ),
+              )
+            : yield* Fiber.join(streamFiber)
+        }
         const streamFailure = Option.getOrUndefined(Exit.findErrorOption(stream))
         const streamInterrupted = Exit.hasInterrupts(stream)
         if (!overflowFailure && publisher.hasStarted()) yield* publisher.streamed()
@@ -159,7 +214,7 @@ export const make = Effect.gen(function* () {
         }
 
         if (overflowFailure) yield* publisher.publish(overflowFailure)
-        const recorded = publisher.record()
+        let recorded = publisher.record()
         const unknownFinish =
           Exit.isSuccess(stream) && recorded.finish?.finish === "unknown"
             ? new AIError({
@@ -169,8 +224,14 @@ export const make = Effect.gen(function* () {
                 }),
               })
             : undefined
-        const llmFailure = streamFailure instanceof AIError ? streamFailure : unknownFinish
-        const llmError = llmFailure && !recorded.providerFailed ? toSessionError(llmFailure) : undefined
+        const llmFailure =
+          streamFailure instanceof AIError
+            ? streamFailure
+            : providerFailure
+              ? new AIError({ reason: new UnknownProviderError({ message: providerFailure.message }) })
+              : unknownFinish
+        const failureError = llmFailure ? toSessionError(llmFailure) : undefined
+        const llmError = failureError && !recorded.providerFailed ? failureError : undefined
         if (
           input.recoverContinuation &&
           llmFailure?.reason._tag === "Transport" &&
@@ -178,23 +239,50 @@ export const make = Effect.gen(function* () {
           !recorded.outputStarted
         )
           return Outcome.RecoverFull()
+        const routeFailure =
+          llmFailure !== undefined &&
+          (SessionRunnerRetry.isRetryable(llmFailure) ||
+            llmFailure.reason._tag === "Authentication" ||
+            llmFailure.reason._tag === "QuotaExceeded")
         const retry =
-          llmFailure && llmError && !isContextOverflowFailure(llmFailure)
+          llmFailure && failureError && !isContextOverflowFailure(llmFailure)
             ? yield* restore(
                 input.retry(
                   llmFailure,
-                  llmError,
+                  failureError,
                   SessionRunnerRetry.isRetryable(llmFailure) ||
+                    (input.model.routing !== undefined && !recorded.outputStarted && routeFailure) ||
                     (recorded.outputStarted && isInterruptedStream(llmFailure)),
                 ),
               )
             : undefined
+
+        if (input.model.routing && llmFailure && failureError && routeFailure) {
+          ModelRoute.failed(input.model.routing.target, input.model.routing.policy)
+          if (!recorded.outputStarted && retry?.retry) {
+            const fallback = yield* Effect.result(input.model.routing.fallback())
+            if (Result.isSuccess(fallback) && fallback.success) {
+              yield* Effect.logInfo("model route failover", {
+                routeID: input.model.routing.routeID,
+                from: `${input.model.routing.target.providerID}/${input.model.routing.target.id}`,
+                to: `${fallback.success.ref.providerID}/${fallback.success.ref.id}`,
+                reason: failureError?.message,
+              })
+              return Outcome.Failover({ model: fallback.success, error: failureError })
+            }
+          }
+        }
+
+        if (providerFailure) {
+          yield* publisher.publish(providerFailure)
+          recorded = publisher.record()
+        }
         if (llmFailure && llmError && retry?.retry && !recorded.outputStarted) {
           // Retry state projects onto the existing assistant, even before it has produced output.
           yield* publisher.startAssistant()
           return Outcome.Retry({ error: llmError, decision: retry })
         }
-        if (llmError) yield* publisher.failAssistant(llmError)
+        if (llmError && !recorded.providerFailed) yield* publisher.failAssistant(llmError)
 
         for (const decline of tools.declines)
           yield* publisher.failTool(decline.call.id, {
@@ -223,6 +311,22 @@ export const make = Effect.gen(function* () {
         }
 
         const record = publisher.record()
+        if (
+          input.model.routing &&
+          Exit.isSuccess(stream) &&
+          record.finish &&
+          !record.failure &&
+          !record.providerFailed &&
+          firstOutputAt !== undefined
+        ) {
+          const completedAt = performance.now()
+          const outputDuration = Math.max(1, completedAt - firstOutputAt)
+          ModelRoute.completed(input.model.routing.target, input.model.routing.policy, {
+            firstTokenMs: firstOutputAt - requestStarted,
+            responseMs: completedAt - requestStarted,
+            tokensPerSecond: ((record.finish.tokens.output + record.finish.tokens.reasoning) * 1_000) / outputDuration,
+          })
+        }
         if (record.finish || record.failure) {
           const snapshot = yield* snapshots.capture()
           const files =

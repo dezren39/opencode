@@ -275,6 +275,10 @@ const layer = Layer.effect(
               error: outcome.error,
               assistantMessageID,
             }),
+          Failover: Effect.fnUntraced(function* (outcome) {
+            yield* modelTransport.close(sessionID)
+            initial = { ...loaded, model: outcome.model }
+          }),
           Continue: Effect.fnUntraced(function* (outcome) {
             yield* retry.wait({
               decision: outcome.decision,
