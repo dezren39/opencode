@@ -3,7 +3,7 @@ export * as ModelResolver from "./model-resolver.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { HttpOptions, LanguageModel, mergeHttpOptions, ProviderConfigurationError } from "@opencode/ai"
 import { Auth } from "@opencode/ai/route"
-import { Context, Effect, Layer, Schema, Struct } from "effect"
+import { Context, Effect, Layer, Result, Schema, Struct } from "effect"
 import { AISDK } from "./aisdk.js"
 import { Credential } from "./credential.js"
 import { Integration } from "./integration.js"
@@ -11,6 +11,7 @@ import { Capabilities, ID, Info, Model, Ref, VariantID } from "./model.js"
 import type { RuntimeInfo } from "./model.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
+import { ModelRoute } from "./model-route.js"
 
 export class VariantUnavailableError extends Schema.TaggedError<VariantUnavailableError>()(
   "SessionRunnerModel.VariantUnavailableError",
@@ -98,6 +99,15 @@ export class UnsupportedCompactionError extends Schema.TaggedError<UnsupportedCo
   }
 }
 
+export class RouteUnavailableError extends Schema.TaggedError<RouteUnavailableError>()(
+  "SessionRunnerModel.RouteUnavailableError",
+  { routeID: ID },
+) {
+  override get message() {
+    return `No model is available for route ${ModelRoute.PROVIDER_ID}/${this.routeID}`
+  }
+}
+
 export type Error =
   | VariantUnavailableError
   | UnsupportedPackageError
@@ -105,6 +115,7 @@ export type Error =
   | ModelInitializationError
   | UnresolvedProviderVariablesError
   | UnsupportedCompactionError
+  | RouteUnavailableError
   | Integration.AuthorizationError
 
 export interface Resolved {
@@ -124,6 +135,13 @@ export interface Resolved {
   readonly transport?: Provider.Transport
   /** Milliseconds without streamed data before a WebSocket exchange fails; `false` disables the limit. */
   readonly chunkTimeout?: number | false
+  /** Selection and health data for a configured OpenCode model route. */
+  readonly routing?: {
+    readonly routeID: ID
+    readonly target: Ref
+    readonly policy: ModelRoute.Policy
+    readonly fallback: () => Effect.Effect<Resolved | undefined, Error>
+  }
 }
 
 export interface Interface {
@@ -357,7 +375,7 @@ export const resolveModel = (
   dependencies?: Dependencies,
 ) => withVariant(model, variant).pipe(Effect.flatMap((model) => fromCatalogModel(model, credential, dependencies)))
 
-export const hasPackage = (model: Info) => Boolean(model.package)
+export const hasPackage = (model: Info) => Boolean(model.package) || ModelRoute.definition(model) !== undefined
 
 /** Resolves catalog selections into runtime models for the current Location. */
 export const layer = Layer.effect(
@@ -405,6 +423,80 @@ export const layer = Layer.effect(
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
       }
     })
+    const resolveRoute = (
+      selected: Info,
+      definition: ModelRoute.Definition,
+      requestedVariant: VariantID | undefined,
+      startIndex: number,
+      allowCooling: boolean,
+    ): Effect.Effect<Resolved | undefined, Error> =>
+      Effect.gen(function* () {
+        const now = Date.now()
+        const indexes = definition.targets.flatMap((_, index) => (index >= startIndex ? [index] : []))
+        const ready = indexes.filter((index) => !ModelRoute.coolingDown(definition.targets[index], now))
+        const candidates = allowCooling
+          ? ready.length > 0
+            ? ready
+            : indexes.toSorted(
+                (left, right) =>
+                  ModelRoute.cooldownUntil(definition.targets[left], now) -
+                  ModelRoute.cooldownUntil(definition.targets[right], now),
+              )
+          : ready
+
+        let lastError: Error | undefined
+        for (const index of candidates) {
+          const target = definition.targets[index]
+          const source = yield* models.get(target.providerID, target.id)
+          if (!source?.enabled) continue
+          const resolved = yield* Effect.result(load(source, target.variant ?? requestedVariant))
+          if (Result.isFailure(resolved)) {
+            ModelRoute.failed(target, definition.health, now)
+            lastError = resolved.failure
+            continue
+          }
+          const current = resolved.success
+          return {
+            ...current,
+            // The alias advertises the safest shared request shape. Pricing and provider metadata stay
+            // tied to the concrete target that answered.
+            capabilities: selected.capabilities,
+            limit: selected.limit,
+            // A native provider checkpoint is not portable across the route's targets.
+            compaction: undefined,
+            routing: {
+              routeID: definition.id,
+              target: current.ref,
+              policy: definition.health,
+              fallback: () => resolveRoute(selected, definition, requestedVariant, index + 1, false),
+            },
+          }
+        }
+        if (lastError) return yield* Effect.fail(lastError)
+        return undefined
+      })
+
+    const resolveSelected = (selected: Info, variant?: VariantID) => {
+      if (selected.providerID !== ModelRoute.PROVIDER_ID) return load(selected, variant)
+      const definition = ModelRoute.definition(selected)
+      if (!definition || definition.targets.length === 0)
+        return Effect.fail(new RouteUnavailableError({ routeID: selected.id }))
+      const requestedVariant = variant === "default" ? undefined : variant
+      if (requestedVariant && !selected.variants.some((item) => item.id === requestedVariant))
+        return Effect.fail(
+          new VariantUnavailableError({
+            providerID: selected.providerID,
+            modelID: selected.id,
+            variant: requestedVariant,
+          }),
+        )
+      return resolveRoute(selected, definition, requestedVariant, 0, true).pipe(
+        Effect.flatMap((resolved) =>
+          resolved ? Effect.succeed(resolved) : Effect.fail(new RouteUnavailableError({ routeID: selected.id })),
+        ),
+      )
+    }
+
     return Service.of({
       resolve: Effect.fn("ModelResolver.resolve")(function* (requested) {
         const selected = requested
@@ -421,9 +513,9 @@ export const layer = Layer.effect(
                 ),
               )
         if (!selected) return undefined
-        return yield* load(selected, requested?.variant)
+        return yield* resolveSelected(selected, requested?.variant)
       }),
-      resolveModel: load,
+      resolveModel: resolveSelected,
     })
   }),
 )

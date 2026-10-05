@@ -1,5 +1,5 @@
 import { expect } from "bun:test"
-import { LanguageModel, LLM, LLMEvent } from "@opencode/ai"
+import { AIError, LanguageModel, LLM, LLMEvent, ProviderInternalError } from "@opencode/ai"
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
 import { TestLLM } from "@opencode/ai/testing"
 import { Agent } from "@opencode/core/agent"
@@ -15,10 +15,12 @@ import { SessionMessage } from "@opencode/core/session/message"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionStep } from "@opencode/core/session/runner/step"
+import { Model } from "@opencode/core/model"
 import { SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { Snapshot } from "@opencode/core/snapshot"
 import { ToolOutput } from "@opencode/core/tool-output"
 import { Money } from "@opencode/schema/money"
+import { ModelRoute } from "@opencode/core/model-route"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { asc, eq } from "drizzle-orm"
 import { Effect, Exit, Layer } from "effect"
@@ -158,3 +160,280 @@ for (const fixture of [
     }),
   )
 }
+
+it.effect("fails over a routed request before any output is committed", () =>
+  Effect.gen(function* () {
+    const db = (yield* Database.Service).db
+    const llm = yield* TestLLM.Test
+    const sessionID = Session.ID.create()
+    const assistantMessageID = SessionMessage.ID.create()
+    const steps = yield* SessionStep.make.pipe(
+      Effect.provide(
+        Layer.mock(Snapshot.Service)({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+        }),
+      ),
+    )
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "route-step",
+        directory: "/project",
+        version: "test",
+      })
+      .run()
+
+    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
+    const cost = [
+      {
+        input: Money.USDPerMillionTokens.make(1),
+        output: Money.USDPerMillionTokens.make(2),
+        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
+      },
+    ]
+    const limit = { context: 100_000, output: 1_000 }
+    const primary = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "primary", provider: "openai", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    const fallback = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "backup", provider: "anthropic", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    let fallbackCalls = 0
+    const model = SessionRunnerModel.resolved(primary.model, {
+      capabilities,
+      cost,
+      limit,
+      routing: {
+        routeID: Model.ID.make("smart-slow"),
+        target: primary.ref,
+        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
+        fallback: () => {
+          fallbackCalls++
+          return Effect.succeed(fallback)
+        },
+      },
+    })
+    yield* llm.push(
+      TestLLM.failAfter(new AIError({ reason: new ProviderInternalError({ message: "primary unavailable" }) })),
+    )
+
+    const result = yield* steps
+      .attempt({
+        isLocationClosed: () => false,
+        sessionID,
+        assistantMessageID,
+        agent: Agent.defaultID,
+        model,
+        prepared: {
+          retry: () => Effect.void,
+          request: LLM.request({ model: model.model, prompt: "Check the service" }),
+          options: {},
+          executeTool: () => Effect.die("not used"),
+        },
+        retry: (_cause, _error, retry) =>
+          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
+        recoverContinuation: true,
+        recoverOverflow: Effect.succeed(false),
+      })
+      .pipe(Effect.exit)
+
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result))
+      expect(result.value).toEqual(SessionStep.Outcome.Failover({ model: fallback, error: expect.anything() }))
+    expect(fallbackCalls).toBe(1)
+    expect(ModelRoute.coolingDown(primary.ref)).toBe(true)
+    expect(yield* llm.requests()).toHaveLength(1)
+  }),
+)
+
+it.live("fails over when a routed provider misses the first-output deadline", () =>
+  Effect.gen(function* () {
+    const db = (yield* Database.Service).db
+    const llm = yield* TestLLM.Test
+    const sessionID = Session.ID.create()
+    const assistantMessageID = SessionMessage.ID.create()
+    const steps = yield* SessionStep.make.pipe(
+      Effect.provide(
+        Layer.mock(Snapshot.Service)({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+        }),
+      ),
+    )
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "route-timeout",
+        directory: "/project",
+        version: "test",
+      })
+      .run()
+
+    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
+    const cost = [
+      {
+        input: Money.USDPerMillionTokens.make(1),
+        output: Money.USDPerMillionTokens.make(2),
+        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
+      },
+    ]
+    const limit = { context: 100_000, output: 1_000 }
+    const primary = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "slow-primary", provider: "openai", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    const fallback = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "fast-backup", provider: "anthropic", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    const model = SessionRunnerModel.resolved(primary.model, {
+      capabilities,
+      cost,
+      limit,
+      routing: {
+        routeID: Model.ID.make("cheap-fast"),
+        target: primary.ref,
+        policy: ModelRoute.policy({ firstTokenTimeoutMs: 10 }),
+        fallback: () => Effect.succeed(fallback),
+      },
+    })
+    yield* llm.push(TestLLM.hangAfter())
+
+    const result = yield* steps
+      .attempt({
+        isLocationClosed: () => false,
+        sessionID,
+        assistantMessageID,
+        agent: Agent.defaultID,
+        model,
+        prepared: {
+          retry: () => Effect.void,
+          request: LLM.request({ model: model.model, prompt: "Quick check" }),
+          options: {},
+          executeTool: () => Effect.die("not used"),
+        },
+        retry: (_cause, _error, retry) =>
+          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
+        recoverContinuation: true,
+        recoverOverflow: Effect.succeed(false),
+      })
+      .pipe(Effect.exit)
+
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result)) expect(result.value._tag).toBe("Failover")
+    expect(ModelRoute.coolingDown(primary.ref)).toBe(true)
+    expect(yield* llm.requests()).toHaveLength(1)
+  }),
+)
+
+it.effect("does not fail over after routed output has started", () =>
+  Effect.gen(function* () {
+    const db = (yield* Database.Service).db
+    const llm = yield* TestLLM.Test
+    const sessionID = Session.ID.create()
+    const assistantMessageID = SessionMessage.ID.create()
+    const steps = yield* SessionStep.make.pipe(
+      Effect.provide(
+        Layer.mock(Snapshot.Service)({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+        }),
+      ),
+    )
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "route-partial",
+        directory: "/project",
+        version: "test",
+      })
+      .run()
+
+    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
+    const cost = [
+      {
+        input: Money.USDPerMillionTokens.make(1),
+        output: Money.USDPerMillionTokens.make(2),
+        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
+      },
+    ]
+    const limit = { context: 100_000, output: 1_000 }
+    const primary = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "primary-partial", provider: "openai", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    const fallback = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "backup-partial", provider: "anthropic", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    let fallbackCalls = 0
+    const model = SessionRunnerModel.resolved(primary.model, {
+      capabilities,
+      cost,
+      limit,
+      routing: {
+        routeID: Model.ID.make("smart-slow"),
+        target: primary.ref,
+        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
+        fallback: () => {
+          fallbackCalls++
+          return Effect.succeed(fallback)
+        },
+      },
+    })
+    yield* llm.push(
+      TestLLM.failAfter(
+        new AIError({ reason: new ProviderInternalError({ message: "failed after partial output" }) }),
+        LLMEvent.textStart({ id: "answer" }),
+        LLMEvent.textDelta({ id: "answer", text: "partial" }),
+      ),
+    )
+
+    const result = yield* steps
+      .attempt({
+        isLocationClosed: () => false,
+        sessionID,
+        assistantMessageID,
+        agent: Agent.defaultID,
+        model,
+        prepared: {
+          retry: () => Effect.void,
+          request: LLM.request({ model: model.model, prompt: "Check the service" }),
+          options: {},
+          executeTool: () => Effect.die("not used"),
+        },
+        retry: (_cause, _error, retry) =>
+          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
+        recoverContinuation: true,
+        recoverOverflow: Effect.succeed(false),
+      })
+      .pipe(Effect.exit)
+
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result)) expect(result.value._tag).not.toBe("Failover")
+    expect(fallbackCalls).toBe(0)
+    expect(ModelRoute.coolingDown(primary.ref)).toBe(true)
+    expect(yield* llm.requests()).toHaveLength(1)
+  }),
+)

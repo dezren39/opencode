@@ -24,6 +24,7 @@ type Input = {
   readonly pendingSnapshot?: Effect.Effect<Snapshot.ID | undefined>
   readonly started: number
   readonly assistantMessageID: SessionMessage.ID
+  readonly deferStepStart?: boolean
 }
 
 const asRecord = (value: unknown): Record<string, unknown> =>
@@ -405,7 +406,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   const publish = Effect.fnUntraced(function* (event: LLMEvent) {
     switch (event.type) {
       case "step-start":
-        yield* startAssistant()
+        if (!input.deferStepStart) yield* startAssistant()
         return
       case "text-start":
         outputStarted = true

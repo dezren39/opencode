@@ -3,6 +3,7 @@ export * as ConfigExperimental from "./experimental.js"
 import { Schema } from "effect"
 import { NonNegativeInt, optional } from "../schema.js"
 import { ConfigPolicy } from "./policy.js"
+import { ConfigModelRoutes } from "./model-routes.js"
 
 export class Info extends Schema.Class<Info>("ConfigExperimental.Info")({
   portable_shell_scanner: Schema.Boolean.pipe(optional).annotate({
@@ -13,5 +14,8 @@ export class Info extends Schema.Class<Info>("ConfigExperimental.Info")({
   }),
   policies: ConfigPolicy.Info.pipe(Schema.Array, optional).annotate({
     description: "Ordered policies controlling access to configured resources",
+  }),
+  model_routes: ConfigModelRoutes.Info.pipe(optional).annotate({
+    description: "Named ordered provider/model routes with failure and performance failover",
   }),
 }) {}

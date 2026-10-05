@@ -6,6 +6,7 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { llmClient } from "./effect/app-node-platform.js"
 import { ModelResolver } from "./model-resolver.js"
+import { ModelRoute } from "./model-route.js"
 import { Model } from "./model.js"
 
 export interface TextInput {
@@ -38,6 +39,9 @@ export const layer = Layer.effect(
 
     const runText = Effect.fn("Generate.text")(function* (input: TextInput) {
       const resolved = yield* resolver.resolve(input.model).pipe(
+        Effect.catchTag("SessionRunnerModel.RouteUnavailableError", (error) =>
+          Effect.fail(new UnavailableError({ message: error.message, service: ModelRoute.PROVIDER_ID })),
+        ),
         Effect.catchTag(
           [
             "SessionRunnerModel.VariantUnavailableError",

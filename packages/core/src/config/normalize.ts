@@ -17,6 +17,7 @@ import { ConfigPolicy } from "@opencode/schema/config/policy"
 import { ConfigProvider } from "@opencode/schema/config/provider"
 import { ConfigReference } from "@opencode/schema/config/reference"
 import { ConfigExperimental } from "@opencode/schema/config/experimental"
+import { ConfigModelRoutes } from "@opencode/schema/config/model-routes"
 import { Permission } from "@opencode/schema/permission"
 import { ConfigAgentV1 } from "../v1/config/agent.js"
 import { ConfigCommandV1 } from "../v1/config/command.js"
@@ -429,6 +430,20 @@ function normalizeExperimental(
           diagnostics,
         )
         if (value !== undefined) result.subagent_depth = value
+      }
+      if (own(experimental, "model_routes")) {
+        const value = decodeMap(
+          experimental.model_routes,
+          ConfigModelRoutes.Route,
+          ["experimental", "model_routes"],
+          diagnostics,
+          decodeEncoded,
+        )
+        if (
+          Object.keys(value).length ||
+          (isRecord(experimental.model_routes) && !Object.keys(experimental.model_routes).length)
+        )
+          result.model_routes = value
       }
       native.push(
         ...decodeList(
