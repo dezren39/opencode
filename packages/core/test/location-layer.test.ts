@@ -595,6 +595,7 @@ describe("LocationServiceMap", () => {
           const withRoutes = yield* inspect(routed.path)
           expect(withRoutes.providers.map(String)).toContain("opencode-route")
           expect(withRoutes.tools).toContain("route_adjust")
+          expect(withRoutes.tools).toContain("route_stats")
           // What the plugin stores must decode, or the route could never be resolved.
           const definition = withRoutes.route && ModelRoute.definition(withRoutes.route)
           expect(definition).toBeDefined()
@@ -610,6 +611,7 @@ describe("LocationServiceMap", () => {
           const without = yield* inspect(plain.path)
           expect(without.providers.map(String)).not.toContain("opencode-route")
           expect(without.tools).not.toContain("route_adjust")
+          expect(without.tools).not.toContain("route_stats")
         }),
       ),
     ),

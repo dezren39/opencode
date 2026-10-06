@@ -123,9 +123,17 @@ export const restoreNotes = (db: Database.Interface["db"]) =>
     restore?.(stored.flatMap((row) => (row.interpreted ? [row.interpreted] : [])))
   })
 
+let activeDb: Database.Interface["db"] | undefined
+
+/** Runs a read against the routing database, or yields nothing when no database is attached. */
+export const withDb = <A, E>(use: (db: Database.Interface["db"]) => Effect.Effect<A, E>) =>
+  activeDb ? Effect.asSome(use(activeDb)) : Effect.succeedNone
+
 const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
+    activeDb = db
+    yield* Effect.addFinalizer(() => Effect.sync(() => void (activeDb = undefined)))
     yield* restoreNotes(db)
     yield* restoreUsageFrom(db)
     const queue = yield* Queue.unbounded<Event>()
@@ -185,4 +193,42 @@ export const recentFailures = (db: Database.Interface["db"], since: number, limi
     .where(and(gte(RouteAttemptTable.time_started, since), sql`${RouteAttemptTable.outcome} != 'success'`))
     .orderBy(desc(RouteAttemptTable.time_started))
     .limit(limit)
+    .all()
+
+export interface ErrorBreakdown {
+  readonly providerID: string
+  readonly modelID: string
+  readonly tag: string | null
+  readonly code: string | null
+  readonly status: number | null
+  readonly count: number
+  readonly lastTime: number
+  readonly lastMessage: string | null
+}
+
+/** Failures grouped by exact tag, code and HTTP status, with the latest message of each group. */
+export const errorBreakdown = (db: Database.Interface["db"], since: number) =>
+  db
+    .select({
+      providerID: RouteAttemptTable.provider_id,
+      modelID: RouteAttemptTable.model_id,
+      tag: RouteAttemptTable.error_tag,
+      code: RouteAttemptTable.error_code,
+      status: RouteAttemptTable.error_status,
+      count: count(),
+      lastTime: sql<number>`max(${RouteAttemptTable.time_started})`,
+      lastMessage: sql<
+        string | null
+      >`(select e.error_message from route_attempt e where e.provider_id = ${RouteAttemptTable.provider_id} and e.model_id = ${RouteAttemptTable.model_id} and e.error_tag is ${RouteAttemptTable.error_tag} and e.error_code is ${RouteAttemptTable.error_code} and e.error_status is ${RouteAttemptTable.error_status} order by e.time_started desc limit 1)`,
+    })
+    .from(RouteAttemptTable)
+    .where(and(gte(RouteAttemptTable.time_started, since), sql`${RouteAttemptTable.outcome} != 'success'`))
+    .groupBy(
+      RouteAttemptTable.provider_id,
+      RouteAttemptTable.model_id,
+      RouteAttemptTable.error_tag,
+      RouteAttemptTable.error_code,
+      RouteAttemptTable.error_status,
+    )
+    .orderBy(desc(count()))
     .all()
