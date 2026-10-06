@@ -35,12 +35,24 @@ const Node = Schema.Struct({
   children: Schema.Array(Schema.Struct({ leaf: Schema.Finite.pipe(optional), node: Schema.Finite.pipe(optional) })),
 })
 
+const Budget = Schema.Struct({
+  requestsPerMinute: Schema.Finite.pipe(optional),
+  requestsPerDay: Schema.Finite.pipe(optional),
+  tokensPerMinute: Schema.Finite.pipe(optional),
+  tokensPerDay: Schema.Finite.pipe(optional),
+  softLimit: Schema.Finite.pipe(optional),
+})
+
+export type Budget = typeof Budget.Type
+
 const Definition = Schema.Struct({
   id: Model.ID,
   targets: Schema.Array(Model.Ref),
   targetVariants: Schema.Array(TargetVariant),
   health: Policy,
   attempts: Schema.Finite.pipe(optional),
+  /** Parallel to `targets`; an empty object means unlimited. */
+  budgets: Schema.Array(Budget).pipe(optional),
   nodes: Schema.Array(Node),
 })
 
@@ -68,8 +80,11 @@ export const policy = (input?: {
   const sampleWindow = Math.min(input?.sampleWindow ?? DEFAULT_POLICY.sampleWindow, 50)
   return {
     firstTokenTimeoutMs: input?.firstTokenTimeoutMs ?? DEFAULT_POLICY.firstTokenTimeoutMs,
-    maxResponseTimeMs: input?.maxResponseTimeMs,
-    minOutputTokensPerSecond: input?.minOutputTokensPerSecond,
+    // Unset thresholds are omitted, not undefined: the stored definition rejects explicit undefined.
+    ...(input?.maxResponseTimeMs !== undefined ? { maxResponseTimeMs: input.maxResponseTimeMs } : {}),
+    ...(input?.minOutputTokensPerSecond !== undefined
+      ? { minOutputTokensPerSecond: input.minOutputTokensPerSecond }
+      : {}),
     sampleWindow,
     slowThreshold: Math.min(input?.slowThreshold ?? DEFAULT_POLICY.slowThreshold, sampleWindow),
     cooldownMs: Math.min(input?.cooldownMs ?? DEFAULT_POLICY.cooldownMs, 3_600_000),
@@ -216,6 +231,7 @@ export const completed = (
 
 /** Test seam; health is intentionally process-local and never persists prompts or request contents. */
 export const resetHealth = () => {
+  usage.clear()
   adjustments = []
   health.clear()
   recentFailures.length = 0
@@ -288,6 +304,86 @@ export const selectSessionTarget = (
   return chosen
 }
 
+// Usage per target in 6-second buckets, enough for per-minute and per-day allowances without
+// remembering individual requests.
+const BUCKET_MS = 6_000
+const DAY_MS = 86_400_000
+const usage = new Map<
+  string,
+  { buckets: Array<{ at: number; requests: number; tokens: number }>; day: { requests: number; tokens: number } }
+>()
+
+const usageEntry = (target: Model.Ref) => {
+  const id = key(target)
+  let current = usage.get(id)
+  if (!current) {
+    current = { buckets: [], day: { requests: 0, tokens: 0 } }
+    usage.set(id, current)
+  }
+  return current
+}
+
+const prune = (state: ReturnType<typeof usageEntry>, now: number) => {
+  while (state.buckets.length > 0 && state.buckets[0].at <= now - DAY_MS) {
+    const old = state.buckets.shift()!
+    state.day.requests -= old.requests
+    state.day.tokens -= old.tokens
+  }
+}
+
+/** Counts one request and its tokens against the target. */
+export const recordUsage = (target: Model.Ref, tokens: number, now = Date.now()) => {
+  const state = usageEntry(target)
+  prune(state, now)
+  const at = Math.floor(now / BUCKET_MS) * BUCKET_MS
+  const last = state.buckets.at(-1)
+  if (last && last.at === at) {
+    last.requests += 1
+    last.tokens += tokens
+  } else if (!last || last.at < at) state.buckets.push({ at, requests: 1, tokens })
+  else return // Restored history older than what is already recorded is added in order by the caller.
+  state.day.requests += 1
+  state.day.tokens += tokens
+  while (usage.size > HEALTH_LIMIT) usage.delete(usage.keys().next().value!)
+}
+
+/** Requests and tokens used by the target in the last minute and the last day. */
+export const usageOf = (target: Model.Ref, now = Date.now()) => {
+  const state = usage.get(key(target))
+  if (!state) return { minute: { requests: 0, tokens: 0 }, day: { requests: 0, tokens: 0 } }
+  prune(state, now)
+  const minute = { requests: 0, tokens: 0 }
+  for (let index = state.buckets.length - 1; index >= 0 && state.buckets[index].at > now - 60_000; index--) {
+    minute.requests += state.buckets[index].requests
+    minute.tokens += state.buckets[index].tokens
+  }
+  return { minute, day: { ...state.day } }
+}
+
+/** True when any allowance in `budget` is used up to its soft limit. */
+export const overBudget = (target: Model.Ref, budget: Budget | undefined, now = Date.now()) => {
+  if (!budget) return false
+  const soft = budget.softLimit ?? 0.9
+  const used = usageOf(target, now)
+  const over = (value: number, limit: number | undefined) => limit !== undefined && value >= limit * soft
+  return (
+    over(used.minute.requests, budget.requestsPerMinute) ||
+    over(used.day.requests, budget.requestsPerDay) ||
+    over(used.minute.tokens, budget.tokensPerMinute) ||
+    over(used.day.tokens, budget.tokensPerDay)
+  )
+}
+
+/** Rebuilds usage from stored history, oldest first, after a restart. */
+export const seedUsage = (
+  rows: ReadonlyArray<{ time: number; providerID: string; modelID: string; tokens: number }>,
+) => {
+  for (const row of rows.toSorted((left, right) => left.time - right.time))
+    recordUsage(ModelRoute_ref(row.providerID, row.modelID), row.tokens, row.time)
+}
+
+const ModelRoute_ref = (providerID: string, modelID: string) => ref({ providerID, model: modelID })
+
 /** An expiring operator or agent instruction about which targets to use. `match` is a case-insensitive
  * substring of `provider/model`, so "anthropic" or "claude" covers every target that looks like it. */
 export interface Adjustment {
@@ -330,6 +426,8 @@ export const removeAdjustment = (id: string) => {
     })
   return existed
 }
+
+ModelRouteLog.onRestoreUsage(seedUsage)
 
 ModelRouteLog.onRestore((notes) => {
   const restored = new Map<string, Adjustment>()

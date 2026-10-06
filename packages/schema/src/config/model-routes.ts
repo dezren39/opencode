@@ -27,6 +27,20 @@ export const Target = Schema.Union([ConfigModel.Selection, TargetObject]).annota
 })
 export type Target = typeof Target.Type
 
+/** Request and token allowances for one target. A target that reaches `softLimit` of any allowance is
+ * passed over until it recovers, so traffic moves before the provider starts refusing it. */
+export class Budget extends Schema.Class<Budget>("Config.ModelRoute.Budget")({
+  requestsPerMinute: PositiveInt.pipe(optional),
+  requestsPerDay: PositiveInt.pipe(optional),
+  tokensPerMinute: PositiveInt.pipe(optional),
+  tokensPerDay: PositiveInt.pipe(optional),
+  softLimit: Schema.Finite.check(Schema.isBetween({ minimum: 0.1, maximum: 1 }))
+    .pipe(optional)
+    .annotate({
+      description: "Fraction of an allowance at which the target is passed over. Defaults to 0.9.",
+    }),
+}) {}
+
 /** Per-target circuit-breaker and response-performance thresholds. */
 export class Health extends Schema.Class<Health>("Config.ModelRoute.Health")({
   firstTokenTimeoutMs: Schema.Union([BoundedPositiveInt, Schema.Literal(false)])
@@ -62,6 +76,10 @@ export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
     description: "Ordered provider/model references. A route may include another route reference.",
   }),
   health: Health.pipe(optional),
+  budgets: Schema.Record(Schema.String, Budget).pipe(optional).annotate({
+    description:
+      'Allowances keyed by target model reference, e.g. { "openai/gpt-6-luna": { "requestsPerDay": 500, "tokensPerMinute": 200000 } }. Usage is counted from every request OpenCode makes to the target and is restored from history after a restart.',
+  }),
   attempts: SampleCount.pipe(optional).annotate({
     description:
       "Requests to make against one target before failing over to the next. Defaults to 1. Retries only happen before any response output, so no tool call ever runs twice.",

@@ -362,6 +362,7 @@ export const make = Effect.gen(function* () {
           const failed = llmFailure !== undefined
           const timedOut = failed && llmFailure.reason._tag === "Transport" && llmFailure.reason.code === "Timeout"
           const tokens = record.finish?.tokens
+          ModelRoute.recordUsage(input.model.ref, tokens ? tokens.input + tokens.output + tokens.reasoning : 0)
           ModelRouteLog.record({
             kind: "attempt",
             row: {

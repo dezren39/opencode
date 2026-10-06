@@ -11,6 +11,7 @@ import { Compatibility, ID, Info, Model, VariantID } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { Variant } from "@opencode/core/variant"
 import { ModelResolver } from "@opencode/core/model-resolver"
+import { ModelRoute } from "@opencode/core/model-route"
 import { AISDK } from "@opencode/core/aisdk"
 import { Npm } from "@opencode/util/npm"
 import { it } from "./lib/effect"
@@ -1546,4 +1547,116 @@ describe("ModelResolver", () => {
       expect(ModelResolver.hasPackage(model(undefined))).toBe(false)
     }),
   )
+})
+
+describe("ModelResolver routes", () => {
+  const leaf = (providerID: string) =>
+    model(Provider.aisdk("@ai-sdk/openai"), {
+      providerID: Provider.ID.make(providerID),
+      modelID: "luna",
+      settings: { apiKey: "key" },
+    })
+
+  const routed = (leaves: ReadonlyArray<ReturnType<typeof leaf>>, definition: Record<string, unknown>) => {
+    const targets = leaves.map((item) => ModelRoute.ref({ providerID: item.providerID, model: item.id }))
+    return Info.make({
+      ...model(undefined),
+      providerID: ModelRoute.PROVIDER_ID,
+      id: ID.make("pool"),
+      settings: {
+        [ModelRoute.SETTING]: {
+          id: "pool",
+          targets,
+          targetVariants: targets.map(() => ({})),
+          health: ModelRoute.policy(),
+          attempts: 1,
+          ...definition,
+        },
+      },
+    })
+  }
+
+  const withResolver = <A, E>(
+    leaves: ReadonlyArray<ReturnType<typeof leaf>>,
+    run: (resolver: ModelResolver.Interface) => Effect.Effect<A, E>,
+  ) => {
+    const provider = Provider.Info.make({
+      ...Provider.Info.empty(leaves[0].providerID),
+      activation: "enabled",
+      package: Provider.aisdk("@ai-sdk/openai"),
+      settings: { apiKey: "key" },
+    })
+    const layer = ModelResolver.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(Provider.Service, { get: () => Effect.succeed(provider) }),
+          Layer.mock(Model.Service, {
+            get: (providerID, id) =>
+              Effect.succeed(leaves.find((item) => item.providerID === providerID && item.id === id)),
+          }),
+          Layer.mock(Integration.Service, {
+            revision: () => 0,
+            connection: { active: () => Effect.undefined },
+          } as never),
+          Layer.mock(Npm.Service, {}),
+          Layer.mock(AISDK.Service, {} as never),
+        ),
+      ),
+    )
+    return withConfigEnv({}, () =>
+      Effect.gen(function* () {
+        return yield* run(yield* ModelResolver.Service)
+      }).pipe(Effect.provide(layer)),
+    )
+  }
+
+  const ordered = {
+    nodes: [{ selection: "ordered", weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] }],
+  }
+  const targetOf = (resolved: ModelResolver.Resolved) => String(resolved.routing?.target.providerID)
+
+  it.effect("skips a target that is over budget, cooling or skipped, and uses it as a last resort", () => {
+    ModelRoute.resetHealth()
+    const a = leaf("pa")
+    const b = leaf("pb")
+    const route = routed([a, b], { ...ordered, budgets: [{ requestsPerMinute: 2, softLimit: 1 }, {}] })
+    return withResolver([a, b], (resolver) =>
+      Effect.gen(function* () {
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pa")
+        ModelRoute.recordUsage(ModelRoute.ref({ providerID: "pa", model: a.id }), 0)
+        ModelRoute.recordUsage(ModelRoute.ref({ providerID: "pa", model: a.id }), 0)
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pb")
+        // The fallback walks on from whichever target answered.
+        ModelRoute.resetHealth()
+        const first = yield* resolver.resolveModel(route)
+        const next = yield* first.routing!.fallback()
+        expect(targetOf(next!)).toBe("pb")
+        // With every target unavailable the least-bad one still answers.
+        ModelRoute.setAdjustments([{ id: "x", match: "p", action: "skip", until: Date.now() + 60_000 }])
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pa")
+        ModelRoute.resetHealth()
+        ModelRoute.failed(ModelRoute.ref({ providerID: "pa", model: a.id }), ModelRoute.policy(), Date.now())
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pb")
+      }),
+    )
+  })
+
+  it.effect("gives each new session its own target in round-robin mode and keeps it", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.resetSelection()
+    const a = leaf("pa")
+    const b = leaf("pb")
+    const route = routed([a, b], {
+      nodes: [{ selection: "round-robin", weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] }],
+    })
+    return withResolver([a, b], (resolver) =>
+      Effect.gen(function* () {
+        const one = targetOf(yield* resolver.resolveModel(route, undefined, "s1"))
+        const two = targetOf(yield* resolver.resolveModel(route, undefined, "s2"))
+        expect(new Set([one, two]).size).toBe(2)
+        expect(targetOf(yield* resolver.resolveModel(route, undefined, "s1"))).toBe(one)
+        expect(targetOf(yield* resolver.resolveModel(route, undefined, "s2"))).toBe(two)
+      }),
+    )
+  })
 })
