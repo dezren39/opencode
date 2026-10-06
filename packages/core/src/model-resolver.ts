@@ -12,6 +12,7 @@ import type { RuntimeInfo } from "./model.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
 import { ModelRoute } from "./model-route.js"
+import { ModelRouteLog } from "./model-route-log.js"
 
 export class VariantUnavailableError extends Schema.TaggedError<VariantUnavailableError>()(
   "SessionRunnerModel.VariantUnavailableError",
@@ -446,6 +447,41 @@ export const layer = Layer.effect(
               )
             : ModelRoute.orderTargets(definition, new Set(ready), sessionID, allowCooling && tried.size === 0)
 
+        if (tried.size === 0 && allowCooling) {
+          const root = definition.nodes[0]
+          const stickyBefore = sessionID ? ModelRoute.sessionTarget(`${definition.id}#0`, sessionID) : undefined
+          ModelRouteLog.record({
+            kind: "decision",
+            row: {
+              time: now,
+              session_id: sessionID,
+              route_id: definition.id,
+              selection: root?.selection ?? "ordered",
+              variant: requestedVariant,
+              candidates: candidates.map(
+                (index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`,
+              ),
+              chosen:
+                candidates[0] === undefined
+                  ? undefined
+                  : `${definition.targets[candidates[0]].providerID}/${definition.targets[candidates[0]].id}`,
+              reason:
+                ready.length === 0
+                  ? "all-cooling"
+                  : !sessionID || !root || root.selection === "ordered"
+                    ? "ordered"
+                    : stickyBefore !== undefined
+                      ? "sticky"
+                      : "drawn",
+              detail: {
+                cooling: indexes
+                  .filter((index) => !ready.includes(index))
+                  .map((index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`),
+              },
+            },
+          })
+        }
+
         let lastError: Error | undefined
         for (const index of candidates) {
           const target = definition.targets[index]
@@ -575,5 +611,5 @@ function usesAPIKeyAuth(packageName: string | undefined) {
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Provider.node, Model.node, Integration.node, Npm.node, AISDK.node],
+  deps: [Provider.node, Model.node, Integration.node, Npm.node, AISDK.node, ModelRouteLog.node],
 })
