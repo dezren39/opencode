@@ -63,6 +63,9 @@ interface Input {
   readonly recoverOverflow: Effect.Effect<boolean>
 }
 
+/** Failed attempts per assistant message and target, so a route can retry a target before failing over. */
+const failedAttempts = new Map<string, number>()
+
 const TOOLS_INTERRUPTED = { type: "aborted", message: "Tool execution interrupted" } as const
 const STEP_INTERRUPTED = { type: "aborted", message: "Step interrupted" } as const
 const RESULT_MISSING = { type: "tool.result-missing", message: "Provider did not return a tool result" } as const
@@ -271,7 +274,19 @@ export const make = Effect.gen(function* () {
               )
             : undefined
 
-        if (input.model.routing && llmFailure && failureError && routeFailure) {
+        // A target gets `attempts` tries before the route moves on. The failure only counts against
+        // the target's health once it is given up on.
+        const retryKey = `${input.assistantMessageID}|${input.model.ref.providerID}/${input.model.ref.id}`
+        const sameTargetRetry =
+          input.model.routing !== undefined &&
+          llmFailure !== undefined &&
+          routeFailure &&
+          !recorded.outputStarted &&
+          retry?.retry === true &&
+          (failedAttempts.get(retryKey) ?? 0) + 1 < input.model.routing.attempts
+        if (sameTargetRetry) failedAttempts.set(retryKey, (failedAttempts.get(retryKey) ?? 0) + 1)
+        else failedAttempts.delete(retryKey)
+        if (input.model.routing && llmFailure && failureError && routeFailure && !sameTargetRetry) {
           ModelRoute.failed(input.model.routing.target, input.model.routing.policy)
           if (!recorded.outputStarted && retry?.retry) {
             const fallback = yield* Effect.result(input.model.routing.fallback())

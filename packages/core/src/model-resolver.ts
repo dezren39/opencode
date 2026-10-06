@@ -141,6 +141,8 @@ export interface Resolved {
     readonly routeID: ID
     readonly target: Ref
     readonly policy: ModelRoute.Policy
+    /** Requests per target before failing over. */
+    readonly attempts: number
     readonly fallback: () => Effect.Effect<Resolved | undefined, Error>
   }
 }
@@ -436,7 +438,11 @@ export const layer = Layer.effect(
       Effect.gen(function* () {
         const now = Date.now()
         const indexes = definition.targets.flatMap((_, index) => (tried.has(index) ? [] : [index]))
-        const ready = indexes.filter((index) => !ModelRoute.coolingDown(definition.targets[index], now))
+        const ready = indexes.filter(
+          (index) =>
+            !ModelRoute.coolingDown(definition.targets[index], now) &&
+            !ModelRoute.skipped(definition.targets[index], now),
+        )
         // When everything is cooling, fall back to the soonest-recovering target rather than failing.
         const candidates =
           allowCooling && ready.length === 0
@@ -509,6 +515,7 @@ export const layer = Layer.effect(
               routeID: definition.id,
               target: current.ref,
               policy: definition.health,
+              attempts: definition.attempts ?? 1,
               fallback: () =>
                 resolveRoute(selected, definition, requestedVariant, new Set([...tried, index]), false, sessionID),
             },

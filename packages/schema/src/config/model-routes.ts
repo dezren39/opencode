@@ -58,6 +58,10 @@ export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
     description: "Ordered provider/model references. A route may include another route reference.",
   }),
   health: Health.pipe(optional),
+  attempts: SampleCount.pipe(optional).annotate({
+    description:
+      "Requests to make against one target before failing over to the next. Defaults to 1. Retries only happen before any response output, so no tool call ever runs twice.",
+  }),
   selection: Schema.Literals(["ordered", "round-robin", "weighted"]).pipe(optional).annotate({
     description:
       "How a session picks its target: ordered uses the configured order (default), round-robin rotates per new session, weighted draws by weights. Either way the choice is sticky for the session and failover falls through the remaining targets in order.",

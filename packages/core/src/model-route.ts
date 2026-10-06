@@ -38,6 +38,7 @@ const Definition = Schema.Struct({
   targets: Schema.Array(Model.Ref),
   targetVariants: Schema.Array(TargetVariant),
   health: Policy,
+  attempts: Schema.Finite.pipe(optional),
   nodes: Schema.Array(Node),
 })
 
@@ -99,7 +100,12 @@ const entry = (target: Model.Ref) => {
   return current
 }
 
-const logHealth = (target: Model.Ref, kind: "cooldown-start" | "cooldown-end", reason: string, until?: number) =>
+const logHealth = (
+  target: Model.Ref,
+  kind: "cooldown-start" | "cooldown-end" | "network-suspect",
+  reason: string,
+  until?: number,
+) =>
   ModelRouteLog.record({
     kind: "health",
     row: { time: Date.now(), provider_id: target.providerID, model_id: target.id, kind, reason, until },
@@ -112,21 +118,49 @@ const recover = (target: Model.Ref, state: { samples: boolean[]; cooldownUntil: 
   logHealth(target, "cooldown-end", "expired")
 }
 
-export const coolingDown = (target: Model.Ref, now = Date.now()) => {
-  const state = health.get(key(target))
-  if (!state) return false
-  recover(target, state, now)
-  return state.cooldownUntil > now
+// A provider-wide fault looks different from a model-specific one. When several models of the same
+// provider are cooling the provider itself is demoted to last resort; when several unrelated
+// providers fail at once the fault is more likely the user's network than any target, so none is
+// punished.
+const NETWORK_WINDOW_MS = 30_000
+const NETWORK_PROVIDERS = 3
+const PROVIDER_MODELS = 2
+const recentFailures: Array<{ readonly provider: string; readonly time: number }> = []
+
+/** True when failures hit many unrelated providers within a short window. */
+export const networkSuspect = (now = Date.now()) =>
+  new Set(
+    recentFailures.filter((failure) => now - failure.time <= NETWORK_WINDOW_MS).map((failure) => failure.provider),
+  ).size >= NETWORK_PROVIDERS
+
+const providerCooldownUntil = (providerID: string, now: number) => {
+  const prefix = `${providerID}/`
+  let count = 0
+  let until = 0
+  for (const [id, state] of health) {
+    if (!id.startsWith(prefix) || state.cooldownUntil <= now) continue
+    count++
+    until = Math.max(until, state.cooldownUntil)
+  }
+  return count >= PROVIDER_MODELS ? until : 0
 }
+
+export const coolingDown = (target: Model.Ref, now = Date.now()) => cooldownUntil(target, now) > now
 
 export const cooldownUntil = (target: Model.Ref, now = Date.now()) => {
   const state = health.get(key(target))
-  if (!state) return 0
-  recover(target, state, now)
-  return state.cooldownUntil
+  if (state) recover(target, state, now)
+  return Math.max(state?.cooldownUntil ?? 0, providerCooldownUntil(target.providerID, now))
 }
 
 export const failed = (target: Model.Ref, policy: Policy, now = Date.now()) => {
+  recentFailures.push({ provider: target.providerID, time: now })
+  while (recentFailures.length > 200 || (recentFailures[0] && now - recentFailures[0].time > NETWORK_WINDOW_MS))
+    recentFailures.shift()
+  if (networkSuspect(now)) {
+    logHealth(target, "network-suspect", "failures across unrelated providers; target not cooled")
+    return
+  }
   const state = entry(target)
   state.samples = []
   state.cooldownUntil = now + policy.cooldownMs
@@ -156,7 +190,11 @@ export const completed = (
 }
 
 /** Test seam; health is intentionally process-local and never persists prompts or request contents. */
-export const resetHealth = () => health.clear()
+export const resetHealth = () => {
+  adjustments = []
+  health.clear()
+  recentFailures.length = 0
+}
 
 /** Per-route selection state: rotation counters for round-robin, sticky session choices, both
  * process-local like health. */
@@ -225,6 +263,73 @@ export const selectSessionTarget = (
   return chosen
 }
 
+/** An expiring operator or agent instruction about which targets to use. `match` is a case-insensitive
+ * substring of `provider/model`, so "anthropic" or "claude" covers every target that looks like it. */
+export interface Adjustment {
+  readonly id: string
+  readonly match: string
+  /** `skip` removes matching targets unless nothing else is available; `weight` scales their share. */
+  readonly action: "skip" | "weight"
+  readonly factor?: number
+  readonly until: number
+  readonly note?: string
+}
+
+let adjustments: readonly Adjustment[] = []
+
+export const setAdjustments = (next: readonly Adjustment[]) => {
+  adjustments = next
+}
+
+/** Adds an adjustment, replacing one with the same id, and records it so it survives a restart. */
+export const addAdjustment = (item: Adjustment, text?: string) => {
+  adjustments = [...adjustments.filter((existing) => existing.id !== item.id), item]
+  ModelRouteLog.record({
+    kind: "note",
+    row: {
+      time: Date.now(),
+      text: text ?? item.note ?? item.id,
+      interpreted: { op: "add", adjustment: item },
+      expires: item.until,
+    },
+  })
+}
+
+export const removeAdjustment = (id: string) => {
+  const existed = adjustments.some((item) => item.id === id)
+  adjustments = adjustments.filter((item) => item.id !== id)
+  if (existed)
+    ModelRouteLog.record({
+      kind: "note",
+      row: { time: Date.now(), text: `remove ${id}`, interpreted: { op: "remove", id } },
+    })
+  return existed
+}
+
+ModelRouteLog.onRestore((notes) => {
+  const restored = new Map<string, Adjustment>()
+  for (const note of notes) {
+    if (note.op === "add" && note.adjustment)
+      restored.set((note.adjustment as Adjustment).id, note.adjustment as Adjustment)
+    if (note.op === "remove" && typeof note.id === "string") restored.delete(note.id)
+  }
+  adjustments = [...restored.values()]
+})
+
+export const activeAdjustments = (now = Date.now()) => adjustments.filter((item) => item.until > now)
+
+const matches = (item: Adjustment, target: Model.Ref) =>
+  `${target.providerID}/${target.id}`.toLowerCase().includes(item.match.toLowerCase())
+
+export const skipped = (target: Model.Ref, now = Date.now()) =>
+  activeAdjustments(now).some((item) => item.action === "skip" && matches(item, target))
+
+/** Combined weight factor for a target; 1 when nothing applies. */
+export const weightFactor = (target: Model.Ref, now = Date.now()) =>
+  activeAdjustments(now)
+    .filter((item) => item.action === "weight" && matches(item, target))
+    .reduce((product, item) => product * (item.factor ?? 1), 1)
+
 /** Walks the group tree into an ordered list of leaf target indexes. Each group puts its chosen
  * child first (sticky per session, drawn only when `draw` is set) and keeps the rest in config
  * order, so failover walks siblings before leaving the group's parent. Groups with no ready leaf
@@ -248,15 +353,30 @@ export const orderTargets = (
           : [],
     )
     const positions = groups.flatMap((group, position) => (group.length > 0 ? [position] : []))
+    // A group's share scales with the average factor of its members, so "favor claude" lifts a
+    // route made mostly of claude targets.
+    const factors = groups.map((group) =>
+      group.length === 0
+        ? 1
+        : group.reduce((sum, leaf) => sum + weightFactor(definition.targets[leaf]), 0) / group.length,
+    )
     let ordered = positions
-    if (sessionID && sessionScoped(node.selection) && positions.length > 1) {
+    if (node.selection === "ordered" && positions.some((position) => factors[position] !== 1)) {
+      ordered = positions.toSorted((left, right) => factors[right] - factors[left])
+    } else if (sessionID && sessionScoped(node.selection) && positions.length > 1) {
       const key = `${definition.id}#${nodeIndex}`
       const sticky = sessionTarget(key, sessionID)
       const chosen =
         sticky !== undefined && positions.includes(sticky)
           ? sticky
           : draw
-            ? selectSessionTarget(key, sessionID, node.selection, positions, node.weights)
+            ? selectSessionTarget(
+                key,
+                sessionID,
+                node.selection,
+                positions,
+                node.weights.map((weight, position) => weight * (factors[position] ?? 1)),
+              )
             : undefined
       if (chosen !== undefined) ordered = [chosen, ...positions.filter((position) => position !== chosen)]
     }
