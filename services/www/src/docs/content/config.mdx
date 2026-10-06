@@ -227,6 +227,22 @@ replays a turn after answer or tool output has started.
       "frontier-heavy": {
         "targets": ["openai/gpt-6-astra", "anthropic/claude-opus-5"],
       },
+      "luna-stack": {
+        "name": "GPT-6 Luna",
+        "selection": "weighted",
+        "weights": { "openai/gpt-6-luna": 3, "github-copilot/gpt-6-luna": 1 },
+        "targets": [
+          {
+            "model": "openai/gpt-6-luna",
+            "defaultVariant": "max",
+            "variants": { "low": "high", "medium": "high" },
+          },
+          {
+            "model": "github-copilot/gpt-6-luna",
+            "defaultVariant": "medium",
+          },
+        ],
+      },
     },
   },
 }
@@ -242,6 +258,21 @@ OpenCode process and are not persisted. A route can reference another route,
 and a requested variant is offered only when every target supports it.
 Provider-use policies still apply to the concrete targets; a route only exposes
 models that remain available after those policies run.
+
+A target can also be an object. `defaultVariant` runs that target at a chosen
+variant when the route is selected without one, and `variants` remaps a
+route-level variant per target, so `opencode-route/luna-stack#low` can run one
+provider at `high` and another at `low`. The route advertises the union of each
+target's native variants and remap keys, and only offers what every target can
+produce.
+
+By default (`"selection": "ordered"`) every session starts at the first healthy
+target. `"round-robin"` gives each new session the next target in rotation and
+`"weighted"` draws one by `weights`, roughly `weights[a] : weights[b]` across
+new sessions. The drawn choice is sticky for the session, so prompt caches stay
+warm; only failure, cooldown expiry, or a re-draw when the sticky target is
+cooling moves a session to another target, and failover still walks the
+remaining targets in order.
 
 Use `opencode-route/cheap-fast`, `opencode-route/smart-slow`, or
 `opencode-route/frontier-heavy` as a category model in OpenChamber's Auto

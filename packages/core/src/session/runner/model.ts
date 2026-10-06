@@ -89,7 +89,7 @@ const layer = Layer.effect(
             providerID: session.model.providerID,
             modelID: session.model.id,
           })
-        return yield* resolver.resolveModel(selected, session.model.variant)
+        return yield* resolver.resolveModel(selected, session.model.variant, session.id)
       }),
     })
   }),

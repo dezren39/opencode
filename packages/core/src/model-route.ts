@@ -17,10 +17,18 @@ const Policy = Schema.Struct({
   cooldownMs: PositiveInt,
 })
 
+const TargetVariant = Schema.Struct({
+  default: Model.VariantID.pipe(optional),
+  map: Schema.Record(Schema.String, Model.VariantID).pipe(optional),
+})
+
 const Definition = Schema.Struct({
   id: Model.ID,
   targets: Schema.Array(Model.Ref),
+  targetVariants: Schema.Array(TargetVariant),
   health: Policy,
+  selection: Schema.Literals(["ordered", "round-robin", "weighted"]),
+  weights: Schema.Array(Schema.Finite.check(Schema.isGreaterThan(0))),
 })
 
 export type Policy = typeof Policy.Type
@@ -129,3 +137,77 @@ export const completed = (
 
 /** Test seam; health is intentionally process-local and never persists prompts or request contents. */
 export const resetHealth = () => health.clear()
+
+/** Per-route selection state: rotation counters for round-robin, sticky session choices, both
+ * process-local like health. */
+const selection = new Map<string, { cursor: number; sessions: Map<string, number> }>()
+const SESSION_LIMIT = 5_000
+
+const selectionEntry = (routeID: string) => {
+  let current = selection.get(routeID)
+  if (!current) {
+    current = { cursor: 0, sessions: new Map() }
+    selection.set(routeID, current)
+  }
+  return current
+}
+
+/** True when the selection mode picks a target per session rather than always starting at the
+ * first healthy one. */
+export const sessionScoped = (mode: "ordered" | "round-robin" | "weighted") => mode !== "ordered"
+
+/** The sticky target index chosen for this session, if one was already made. */
+export const sessionTarget = (routeID: string, sessionID: string) => {
+  const state = selection.get(routeID)
+  const index = state?.sessions.get(sessionID)
+  return index === undefined ? undefined : index
+}
+
+/** Chooses the session's target index. `ordered` always returns the first entry; round-robin
+ * advances a shared cursor; weighted draws by relative ratio. Only the outcome is sticky. */
+export const selectSessionTarget = (
+  routeID: string,
+  sessionID: string,
+  mode: "ordered" | "round-robin" | "weighted",
+  candidateIndexes: readonly number[],
+  weights: readonly number[],
+): number | undefined => {
+  if (candidateIndexes.length === 0) return undefined
+  const first = candidateIndexes[0]
+  if (mode === "ordered" || candidateIndexes.length === 1) return first
+  const state = selectionEntry(routeID)
+  const sticky = state.sessions.get(sessionID)
+  if (sticky !== undefined && candidateIndexes.includes(sticky)) return sticky
+  let chosen: number
+  if (mode === "round-robin") {
+    const positions = candidateIndexes.map((index, position) => [position, index] as const)
+    const at = state.cursor % candidateIndexes.length
+    chosen = positions[at][1]
+    state.cursor = (state.cursor + 1) % Number.MAX_SAFE_INTEGER
+  } else {
+    const total = candidateIndexes.reduce((sum, index) => sum + (weights[index] ?? 1), 0)
+    let draw = Math.random() * total
+    chosen = candidateIndexes[candidateIndexes.length - 1]
+    for (const index of candidateIndexes) {
+      draw -= weights[index] ?? 1
+      if (draw <= 0) {
+        chosen = index
+        break
+      }
+    }
+  }
+  state.sessions.set(sessionID, chosen)
+  while (state.sessions.size > SESSION_LIMIT) {
+    const oldest = state.sessions.keys().next().value
+    if (oldest === undefined) break
+    state.sessions.delete(oldest)
+  }
+  return chosen
+}
+
+/** Drops a session's sticky choice, e.g. when its model selection leaves the route. Test seam. */
+export const forgetSession = (routeID: string, sessionID: string) => {
+  selection.get(routeID)?.sessions.delete(sessionID)
+}
+
+export const resetSelection = () => selection.clear()

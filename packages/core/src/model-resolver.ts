@@ -146,7 +146,8 @@ export interface Resolved {
 
 export interface Interface {
   readonly resolve: (requested?: Ref) => Effect.Effect<Resolved | undefined, Error>
-  readonly resolveModel: (model: Info, variant?: VariantID) => Effect.Effect<Resolved, Error>
+  /** `sessionID` enables per-session target stickiness for routes with a non-ordered selection mode. */
+  readonly resolveModel: (model: Info, variant?: VariantID, sessionID?: string) => Effect.Effect<Resolved, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ModelResolver") {}
@@ -429,12 +430,13 @@ export const layer = Layer.effect(
       requestedVariant: VariantID | undefined,
       startIndex: number,
       allowCooling: boolean,
+      sessionID?: string,
     ): Effect.Effect<Resolved | undefined, Error> =>
       Effect.gen(function* () {
         const now = Date.now()
         const indexes = definition.targets.flatMap((_, index) => (index >= startIndex ? [index] : []))
         const ready = indexes.filter((index) => !ModelRoute.coolingDown(definition.targets[index], now))
-        const candidates = allowCooling
+        let candidates = allowCooling
           ? ready.length > 0
             ? ready
             : indexes.toSorted(
@@ -443,13 +445,35 @@ export const layer = Layer.effect(
                   ModelRoute.cooldownUntil(definition.targets[right], now),
               )
           : ready
+        // A session keeps the target it drew when it first used the route; failover still walks
+        // the remaining targets in order.
+        if (sessionID && startIndex === 0 && allowCooling && candidates.length > 1) {
+          const sticky = ModelRoute.sessionTarget(definition.id, sessionID)
+          if (sticky !== undefined && candidates.includes(sticky)) {
+            candidates = [sticky, ...candidates.filter((index) => index !== sticky)]
+          } else if (ModelRoute.sessionScoped(definition.selection)) {
+            const drawn = ModelRoute.selectSessionTarget(
+              definition.id,
+              sessionID,
+              definition.selection,
+              candidates,
+              definition.weights,
+            )
+            if (drawn !== undefined && drawn !== candidates[0]) {
+              candidates = [drawn, ...candidates.filter((index) => index !== drawn)]
+            }
+          }
+        }
 
         let lastError: Error | undefined
         for (const index of candidates) {
           const target = definition.targets[index]
           const source = yield* models.get(target.providerID, target.id)
           if (!source?.enabled) continue
-          const resolved = yield* Effect.result(load(source, target.variant ?? requestedVariant))
+          const targetVariants = definition.targetVariants[index]
+          const mapped =
+            requestedVariant !== undefined ? targetVariants?.map?.[requestedVariant] : targetVariants?.default
+          const resolved = yield* Effect.result(load(source, target.variant ?? mapped))
           if (Result.isFailure(resolved)) {
             ModelRoute.failed(target, definition.health, now)
             lastError = resolved.failure
@@ -468,7 +492,7 @@ export const layer = Layer.effect(
               routeID: definition.id,
               target: current.ref,
               policy: definition.health,
-              fallback: () => resolveRoute(selected, definition, requestedVariant, index + 1, false),
+              fallback: () => resolveRoute(selected, definition, requestedVariant, index + 1, false, sessionID),
             },
           }
         }
@@ -476,7 +500,7 @@ export const layer = Layer.effect(
         return undefined
       })
 
-    const resolveSelected = (selected: Info, variant?: VariantID) => {
+    const resolveSelected = (selected: Info, variant?: VariantID, sessionID?: string) => {
       if (selected.providerID !== ModelRoute.PROVIDER_ID) return load(selected, variant)
       const definition = ModelRoute.definition(selected)
       if (!definition || definition.targets.length === 0)
@@ -490,7 +514,7 @@ export const layer = Layer.effect(
             variant: requestedVariant,
           }),
         )
-      return resolveRoute(selected, definition, requestedVariant, 0, true).pipe(
+      return resolveRoute(selected, definition, requestedVariant, 0, true, sessionID).pipe(
         Effect.flatMap((resolved) =>
           resolved ? Effect.succeed(resolved) : Effect.fail(new RouteUnavailableError({ routeID: selected.id })),
         ),
@@ -515,7 +539,7 @@ export const layer = Layer.effect(
         if (!selected) return undefined
         return yield* resolveSelected(selected, requested?.variant)
       }),
-      resolveModel: resolveSelected,
+      resolveModel: (selected, variant, sessionID) => resolveSelected(selected, variant, sessionID),
     })
   }),
 )

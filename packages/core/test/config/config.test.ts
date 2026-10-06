@@ -847,6 +847,18 @@ describe("Config", () => {
             targets: ["openai/gpt-6-luna", "github-copilot/gpt-6-luna"],
             health: { maxResponseTimeMs: 45_000 },
           },
+          "luna-stack": {
+            targets: [
+              {
+                model: "openai/gpt-6-luna",
+                defaultVariant: "max",
+                variants: { low: "high", medium: "high" },
+              },
+              { model: "anthropic/claude-sonnet-5", defaultVariant: "medium" },
+            ],
+            selection: "weighted",
+            weights: { "openai/gpt-6-luna": 3, "anthropic/claude-sonnet-5": 1 },
+          },
         },
       },
     })
@@ -858,6 +870,18 @@ describe("Config", () => {
         { providerID: "github-copilot", model: "gpt-6-luna" },
       ],
       health: { maxResponseTimeMs: 45_000 },
+    })
+    expect(migrated.experimental?.model_routes?.["luna-stack"]).toMatchObject({
+      selection: "weighted",
+      weights: { "openai/gpt-6-luna": 3, "anthropic/claude-sonnet-5": 1 },
+      targets: [
+        {
+          model: { providerID: "openai", model: "gpt-6-luna" },
+          defaultVariant: "max",
+          variants: { low: "high", medium: "high" },
+        },
+        { model: { providerID: "anthropic", model: "claude-sonnet-5" }, defaultVariant: "medium" },
+      ],
     })
   })
 

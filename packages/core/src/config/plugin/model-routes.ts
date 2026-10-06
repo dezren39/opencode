@@ -15,6 +15,10 @@ type SourceModel = {
   readonly ref: Model.Ref
   readonly model: Model.Info
   readonly fixedVariant: boolean
+  /** Variant used when the route is selected without an explicit one. */
+  readonly defaultVariant?: Model.VariantID
+  /** Route-level variant → this target's variant. */
+  readonly variantMap?: Readonly<Record<string, Model.VariantID>>
 }
 
 export const Plugin = define({
@@ -35,6 +39,8 @@ export const Plugin = define({
         if (expanded.length === 0) return undefined
         const first = expanded[0].model
         const health = ModelRoute.policy(route.health)
+        const selection = route.selection ?? "ordered"
+        const weights = expanded.map((target) => route.weights?.[`${target.ref.providerID}/${target.ref.id}`] ?? 1)
         const info = Model.Info.make({
           ...Model.Info.default(ModelRoute.PROVIDER_ID, Model.ID.make(id)),
           name: route.name?.trim() || id,
@@ -42,7 +48,13 @@ export const Plugin = define({
             [ModelRoute.SETTING]: {
               id: Model.ID.make(id),
               targets: expanded.map((target) => target.ref),
+              targetVariants: expanded.map((target) => ({
+                ...(target.defaultVariant ? { default: target.defaultVariant } : {}),
+                ...(target.variantMap ? { map: target.variantMap } : {}),
+              })),
               health,
+              selection,
+              weights,
             },
           },
           capabilities: {
@@ -101,7 +113,8 @@ function expand(
     if (!current) return
     const nextTrail = new Set(trail).add(routeID)
     for (const target of current.targets) {
-      const ref = targetRef(target)
+      const spec = targetSpec(target)
+      const ref = targetRef(spec.model)
       if (ref.providerID === ModelRoute.PROVIDER_ID) {
         if (ref.variant) {
           visit(ref.id, ref.variant, nextTrail)
@@ -122,12 +135,31 @@ function expand(
       const key = `${resolved.providerID}/${resolved.id}${resolved.variant ? `#${resolved.variant}` : ""}`
       if (seen.has(key)) continue
       seen.add(key)
-      result.push({ ref: resolved, model, fixedVariant: ref.variant !== undefined || inheritedVariant !== undefined })
+      const defaultVariant =
+        spec.defaultVariant && model.variants.some((item) => item.id === spec.defaultVariant)
+          ? Model.VariantID.make(spec.defaultVariant)
+          : undefined
+      const variantMap = Object.fromEntries(
+        Object.entries(spec.variants ?? {}).flatMap(([from, to]) =>
+          model.variants.some((item) => item.id === to) ? [[from, Model.VariantID.make(to)] as const] : [],
+        ),
+      )
+      result.push({
+        ref: resolved,
+        model,
+        fixedVariant: ref.variant !== undefined || inheritedVariant !== undefined,
+        ...(defaultVariant ? { defaultVariant } : {}),
+        ...(Object.keys(variantMap).length ? { variantMap } : {}),
+      })
     }
   }
 
   visit(id, undefined, new Set())
   return result
+}
+
+function targetSpec(target: ConfigModelRoutes.Target) {
+  return typeof target === "string" || "providerID" in target ? { model: target } : target
 }
 
 function targetRef(target: ConfigModel.Selection): Model.Ref {
@@ -145,7 +177,13 @@ function intersect(values: readonly (readonly string[])[]) {
 
 function routeVariants(targets: readonly SourceModel[]) {
   if (targets.some((target) => target.fixedVariant)) return []
-  return intersect(targets.map((target) => target.model.variants.map((variant) => variant.id))).map((id) => ({
-    id: Model.VariantID.make(id),
-  }))
+  // A route-level variant is offered when every target can produce it, either natively or through
+  // its remap table.
+  return intersect(
+    targets.map((target) => {
+      const native = target.model.variants.map((variant) => variant.id)
+      const remapped = Object.keys(target.variantMap ?? {})
+      return [...new Set([...native, ...remapped])]
+    }),
+  ).map((id) => ({ id: Model.VariantID.make(id) }))
 }
