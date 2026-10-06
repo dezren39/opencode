@@ -274,6 +274,41 @@ warm; only failure, cooldown expiry, or a re-draw when the sticky target is
 cooling moves a session to another target, and failover still walks the
 remaining targets in order.
 
+Routes nest. Every route is a group with its own `selection` and `weights`: a
+parent picks a nested route as one unit (key it as `"opencode-route/<id>"` in
+`weights`), and the nested route then picks among its own members. A weighted
+3:1 split between `luna` and `claude`, where `luna` is round-robin over three
+providers, sends 75% of new sessions to `luna` and about 25% to each Luna
+provider. A group with nothing healthy drops out and its weight goes to its
+siblings.
+
+Set `attempts` (default 1) to retry a target that many times before the route
+moves on. Retries only happen before any output, so a tool call never runs
+twice. A target that fails is not penalized until its attempts are used up.
+
+Failures are also correlated. When two or more models of one provider are
+cooling, the whole provider is demoted to last resort until they recover. When
+three or more unrelated providers fail within 30 seconds, the cause is more
+likely your network than any one target, so no target is cooled.
+
+While routes are configured, the `route_adjust` tool lets you tell the agent
+things like "my Anthropic promo credits expire in 3 days, favor Claude" or "skip
+glm today". It records an expiring adjustment: `weight` with a factor, or
+`skip`, matched by a case-insensitive substring of `provider/model`. Ordered
+groups try favored targets first, weighted groups scale their share, and a
+skipped target is only used when nothing else is available. Adjustments survive
+restarts until they expire.
+
+OpenCode records routing history in its database for analysis and tuning:
+`route_decision` (what was eligible, what was drawn and why), `route_attempt`
+(per request: exact error tag, code, HTTP status, message and response body,
+rate-limit details, first-token and total latency, tokens per second, and
+input, output, reasoning and cache token counts), `route_health` (cooldown
+starts, ends and network-suspect events) and `route_note` (adjustments).
+Rows carry the session and assistant message IDs so they join to the session
+tables, which already hold per-step usage and cost. Prompts and responses are
+never stored, and nothing is pruned automatically.
+
 Use `opencode-route/cheap-fast`, `opencode-route/smart-slow`, or
 `opencode-route/frontier-heavy` as a category model in OpenChamber's Auto
 routing settings to compose `Auto → Jev category/agent → provider pool`.
