@@ -567,6 +567,7 @@ describe("LocationServiceMap", () => {
                       targets: ["opencode-route/inner", { model: "pool/one", defaultVariant: "max" }],
                       selection: "round-robin",
                       attempts: 2,
+                      hedgeAfterMs: 2500,
                       health: { cooldownMs: 1000, maxResponseTimeMs: 5000 },
                       budgets: { "pool/one": { requestsPerDay: 10, softLimit: 0.8 } },
                     },
@@ -600,6 +601,7 @@ describe("LocationServiceMap", () => {
           const definition = withRoutes.route && ModelRoute.definition(withRoutes.route)
           expect(definition).toBeDefined()
           expect(definition?.attempts).toBe(2)
+          expect(definition?.hedgeAfterMs).toBe(2500)
           expect(definition?.health).toMatchObject({ cooldownMs: 1000, maxResponseTimeMs: 5000 })
           expect(definition?.targets.map((target) => `${target.providerID}/${target.id}`)).toEqual([
             "pool/one",

@@ -68,6 +68,7 @@ export const Plugin = define({
               health,
               nodes,
               attempts: route.attempts ?? 1,
+              ...(route.hedgeAfterMs ? { hedgeAfterMs: route.hedgeAfterMs } : {}),
               budgets: expanded.map((target) => target.budget ?? {}),
             },
           },

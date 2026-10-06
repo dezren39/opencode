@@ -31,6 +31,7 @@ import { ModelRoute } from "../../model-route.js"
 import { ModelRouteLog } from "../../model-route-log.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
+import { SessionHedge } from "./hedge.js"
 import { SessionRunnerRetry } from "./retry.js"
 
 export type Outcome = Data.TaggedEnum<{
@@ -59,6 +60,10 @@ interface Input {
     retry: boolean,
   ) => Effect.Effect<{ readonly retry: false } | SessionRunnerRetry.Decision>
   readonly recoverContinuation: boolean
+  /** Prepares the same request for another target of the route, so a slow attempt can be hedged. */
+  readonly prepareFor?: (
+    model: SessionRunnerModel.Resolved,
+  ) => Effect.Effect<Omit<SessionModelRequest.Prepared, "event">>
   /** The runner owns compaction policy; the attempt invokes it only before durable output. */
   readonly recoverOverflow: Effect.Effect<boolean>
 }
@@ -92,12 +97,16 @@ export const make = Effect.gen(function* () {
   const snapshots = yield* Snapshot.Service
   const toolOutput = yield* ToolOutput.Service
 
-  const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
+  const run = Effect.fn("SessionStep.run")(function* (
+    input: Input,
+    /** Events already being produced for this attempt, from a hedge race. */
+    raced?: { readonly stream: Stream.Stream<LLMEvent, AIError>; readonly startedAt: number },
+  ) {
     // The start snapshot only has to exist before local tools run, which cannot happen before Step.Started,
     // so it is captured while the provider request is in flight instead of delaying it.
     const pendingStartSnapshot = yield* snapshots.capture().pipe(Effect.forkScoped)
-    const requestStarted = performance.now()
-    const wallStarted = Date.now()
+    const requestStarted = raced?.startedAt ?? performance.now()
+    const wallStarted = Date.now() - (performance.now() - requestStarted)
     const firstOutput = yield* Deferred.make<void>()
     const publisher = createLLMEventPublisher(bus, {
       sessionID: input.sessionID,
@@ -132,7 +141,7 @@ export const make = Effect.gen(function* () {
     let providerFailure: ProviderErrorEvent | undefined
     let firstOutputAt: number | undefined
     // Read to the end, not just the finish event, so the next request can reuse this response.
-    const providerStream = llm.stream(input.prepared.request, input.prepared.options).pipe(
+    const providerStream = (raced?.stream ?? llm.stream(input.prepared.request, input.prepared.options)).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           if (overflowFailure || providerFailure || publisher.hasProviderError()) return
@@ -456,6 +465,59 @@ export const make = Effect.gen(function* () {
         })
       }),
     )
+  }, Effect.scoped)
+
+  /** One request, or two when the route hedges: see SessionHedge.race. */
+  const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
+    const routing = input.model.routing
+    const prepareFor = input.prepareFor
+    if (!routing?.hedgeAfterMs || !prepareFor) return yield* run(input)
+    const raced = yield* SessionHedge.race({
+      primary: llm.stream(input.prepared.request, input.prepared.options),
+      afterMs: routing.hedgeAfterMs,
+      deadlineMs: typeof routing.policy.firstTokenTimeoutMs === "number" ? routing.policy.firstTokenTimeoutMs : 60_000,
+      // No next target, or one that cannot be prepared, simply means there is nothing to hedge with.
+      start: Effect.suspend(() => routing.fallback()).pipe(
+        Effect.flatMap((next) =>
+          next === undefined
+            ? Effect.succeed(Option.none())
+            : prepareFor(next).pipe(
+                Effect.map((prepared) =>
+                  Option.some({
+                    value: { model: next, prepared },
+                    stream: llm.stream(prepared.request, prepared.options),
+                  }),
+                ),
+              ),
+        ),
+        Effect.catch(() => Effect.succeed(Option.none())),
+      ),
+    })
+    if (raced.hedgeStarted) {
+      // The target that lost: the primary when the hedge answered first, otherwise the hedge.
+      const loser = raced.winner === "hedge" ? input.model : raced.hedgeValue?.model
+      if (raced.winner === "hedge") ModelRoute.slow(input.model.ref, routing.policy)
+      ModelRouteLog.record({
+        kind: "attempt",
+        row: {
+          time_started: Date.now() - raced.primaryElapsedMs,
+          time_ended: Date.now(),
+          session_id: input.sessionID,
+          assistant_message_id: input.assistantMessageID,
+          route_id: routing.routeID,
+          provider_id: loser?.ref.providerID ?? input.model.ref.providerID,
+          model_id: loser?.ref.id ?? input.model.ref.id,
+          outcome: "hedged-out",
+          output_started: false,
+          response_ms: raced.primaryElapsedMs,
+        },
+      })
+    }
+    const winner = raced.winner === "hedge" ? raced.value : undefined
+    return yield* run(winner ? { ...input, model: winner.model, prepared: winner.prepared } : input, {
+      stream: raced.stream,
+      startedAt: raced.startedAt,
+    })
   }, Effect.scoped)
 
   return { attempt }

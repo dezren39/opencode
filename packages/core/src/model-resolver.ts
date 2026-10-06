@@ -143,6 +143,8 @@ export interface Resolved {
     readonly policy: ModelRoute.Policy
     /** Requests per target before failing over. */
     readonly attempts: number
+    /** Start the next target if this one is silent after this long. */
+    readonly hedgeAfterMs?: number
     readonly fallback: () => Effect.Effect<Resolved | undefined, Error>
   }
 }
@@ -520,6 +522,7 @@ export const layer = Layer.effect(
               target: current.ref,
               policy: definition.health,
               attempts: definition.attempts ?? 1,
+              ...(definition.hedgeAfterMs ? { hedgeAfterMs: definition.hedgeAfterMs } : {}),
               fallback: () =>
                 resolveRoute(selected, definition, requestedVariant, new Set([...tried, index]), false, sessionID),
             },

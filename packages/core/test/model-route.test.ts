@@ -260,3 +260,17 @@ describe("ModelRoute budgets", () => {
     expect(ModelRoute.usageOf(t, 4_000).day).toEqual({ requests: 2, tokens: 40 })
   })
 })
+
+describe("ModelRoute.slow", () => {
+  test("repeated slow losses cool a target down like any other slow one", () => {
+    ModelRoute.resetHealth()
+    const policy = ModelRoute.policy({ sampleWindow: 5, slowThreshold: 3, cooldownMs: 60_000 })
+    const t = ModelRoute.ref({ providerID: "openai", model: "slowpoke" })
+    ModelRoute.slow(t, policy, 1_000)
+    ModelRoute.slow(t, policy, 2_000)
+    expect(ModelRoute.coolingDown(t, 2_000)).toBe(false)
+    ModelRoute.slow(t, policy, 3_000)
+    expect(ModelRoute.coolingDown(t, 3_000)).toBe(true)
+    expect(ModelRoute.coolingDown(t, 64_000)).toBe(false)
+  })
+})

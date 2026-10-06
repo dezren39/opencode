@@ -34,7 +34,7 @@ export class Budget extends Schema.Class<Budget>("Config.ModelRoute.Budget")({
   requestsPerDay: PositiveInt.pipe(optional),
   tokensPerMinute: PositiveInt.pipe(optional),
   tokensPerDay: PositiveInt.pipe(optional),
-  softLimit: Schema.Finite.check(Schema.isBetween({ minimum: 0.1, maximum: 1 }))
+  softLimit: Schema.Finite.check(Schema.isBetween({ minimum: 0.125, maximum: 1 }))
     .pipe(optional)
     .annotate({
       description: "Fraction of an allowance at which the target is passed over. Defaults to 0.9.",
@@ -79,6 +79,10 @@ export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
   budgets: Schema.Record(Schema.String, Budget).pipe(optional).annotate({
     description:
       'Allowances keyed by target model reference, e.g. { "openai/gpt-6-luna": { "requestsPerDay": 500, "tokensPerMinute": 200000 } }. Usage is counted from every request OpenCode makes to the target and is restored from history after a restart.',
+  }),
+  hedgeAfterMs: BoundedPositiveInt.pipe(optional).annotate({
+    description:
+      "Send the same request to the next target when the current one has produced no output after this many milliseconds. The first to answer wins and the other is cancelled; nothing is shown or run before a winner is known. Costs a duplicate request whenever the first target is slow. Off by default.",
   }),
   attempts: SampleCount.pipe(optional).annotate({
     description:
