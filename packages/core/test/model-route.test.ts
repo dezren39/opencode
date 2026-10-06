@@ -202,3 +202,26 @@ describe("ModelRoute correlation and adjustments", () => {
     expect(ModelRoute.skipped(targets[1])).toBe(false)
   })
 })
+
+describe("ModelRoute failure hints", () => {
+  const policy = ModelRoute.policy({ cooldownMs: 60_000, quotaCooldownMs: 900_000 })
+  const t = ModelRoute.ref({ providerID: "openai", model: "hint" })
+
+  test("a stated retry-after sets the cooldown, capped at a day", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.failed(t, policy, 1_000, { retryAfterMs: 5_000 })
+    expect(ModelRoute.cooldownUntil(t, 1_000)).toBe(6_000)
+    ModelRoute.resetHealth()
+    ModelRoute.failed(t, policy, 1_000, { retryAfterMs: 10 ** 12 })
+    expect(ModelRoute.cooldownUntil(t, 1_000)).toBe(1_000 + 86_400_000)
+  })
+
+  test("an exhausted quota outlasts an ordinary failure", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.failed(t, policy, 1_000, { quota: true })
+    expect(ModelRoute.cooldownUntil(t, 1_000)).toBe(1_000 + 900_000)
+    ModelRoute.resetHealth()
+    ModelRoute.failed(t, policy, 1_000)
+    expect(ModelRoute.cooldownUntil(t, 1_000)).toBe(1_000 + 60_000)
+  })
+})

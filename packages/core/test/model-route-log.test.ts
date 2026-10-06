@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { Database } from "@opencode/core/database/database"
+import { ModelRoute } from "@opencode/core/model-route"
 import { ModelRouteLog } from "@opencode/core/model-route-log"
 import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable } from "@opencode/core/model-route-log/sql"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -70,6 +71,37 @@ describe("ModelRouteLog", () => {
       expect(stats).toHaveLength(1)
       expect(stats[0]).toMatchObject({ attempts: 2, failures: 1, avgFirstTokenMs: 100 })
       expect(yield* ModelRouteLog.recentFailures(db, 0)).toHaveLength(1)
+    }),
+  )
+})
+
+describe("route note restore", () => {
+  it.live("restores active adjustments, drops expired and removed ones", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const now = Date.now()
+      const add = (id: string, until: number, time: number) =>
+        ModelRouteLog.record({
+          kind: "note",
+          row: {
+            time,
+            text: id,
+            expires: until,
+            interpreted: { op: "add", adjustment: { id, match: id, action: "skip", until } },
+          },
+        })
+      add("keep", now + 60_000, now - 3)
+      add("expired", now - 1, now - 2)
+      add("removed", now + 60_000, now - 1)
+      ModelRouteLog.record({
+        kind: "note",
+        row: { time: now, text: "remove", interpreted: { op: "remove", id: "removed" } },
+      })
+      yield* Effect.sleep("100 millis")
+
+      ModelRoute.setAdjustments([])
+      yield* ModelRouteLog.restoreNotes(db)
+      expect(ModelRoute.activeAdjustments().map((item) => item.id)).toEqual(["keep"])
     }),
   )
 })

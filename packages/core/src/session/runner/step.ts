@@ -65,6 +65,16 @@ interface Input {
 
 /** Failed attempts per assistant message and target, so a route can retry a target before failing over. */
 const failedAttempts = new Map<string, number>()
+const FAILED_ATTEMPT_LIMIT = 1_000
+
+/** Cooldown input from a provider error: a stated retry-after, or an exhausted quota. */
+const failureHint = (failure: AIError): ModelRoute.FailureHint => {
+  const reason = failure.reason as { _tag: string; retryAfterMs?: number; rateLimit?: { retryAfterMs?: number } }
+  return {
+    retryAfterMs: reason.retryAfterMs ?? reason.rateLimit?.retryAfterMs,
+    quota: reason._tag === "QuotaExceeded",
+  }
+}
 
 const TOOLS_INTERRUPTED = { type: "aborted", message: "Tool execution interrupted" } as const
 const STEP_INTERRUPTED = { type: "aborted", message: "Step interrupted" } as const
@@ -272,10 +282,12 @@ export const make = Effect.gen(function* () {
           !recorded.outputStarted &&
           retry?.retry === true &&
           (failedAttempts.get(retryKey) ?? 0) + 1 < input.model.routing.attempts
-        if (sameTargetRetry) failedAttempts.set(retryKey, (failedAttempts.get(retryKey) ?? 0) + 1)
-        else failedAttempts.delete(retryKey)
+        if (sameTargetRetry) {
+          failedAttempts.set(retryKey, (failedAttempts.get(retryKey) ?? 0) + 1)
+          while (failedAttempts.size > FAILED_ATTEMPT_LIMIT) failedAttempts.delete(failedAttempts.keys().next().value!)
+        } else failedAttempts.delete(retryKey)
         if (input.model.routing && llmFailure && failureError && routeFailure && !sameTargetRetry) {
-          ModelRoute.failed(input.model.routing.target, input.model.routing.policy)
+          ModelRoute.failed(input.model.routing.target, input.model.routing.policy, Date.now(), failureHint(llmFailure))
           if (!recorded.outputStarted && retry?.retry) {
             const fallback = yield* Effect.result(input.model.routing.fallback())
             if (Result.isSuccess(fallback) && fallback.success) {

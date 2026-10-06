@@ -1,7 +1,9 @@
 export * as RouteAdjustTool from "./route-adjust.js"
 
 import type { ToolEditor } from "@opencode/plugin/effect/tool"
+import { ToolFailure } from "@opencode/ai"
 import { Effect, Schema } from "effect"
+import type { Permission } from "../../permission.js"
 import { ModelRoute } from "../../model-route.js"
 
 export const name = "route_adjust"
@@ -34,47 +36,61 @@ export const Output = Schema.Struct({ adjustments: Schema.Array(Schema.Unknown) 
 const describe = (item: ModelRoute.Adjustment) =>
   `${item.id}: ${item.action}${item.action === "weight" ? ` x${item.factor ?? 1}` : ""} "${item.match}" until ${new Date(item.until).toISOString()}${item.note ? ` (${item.note})` : ""}`
 
-/** Registered only while model routes are configured, so other setups carry no extra tool. */
-export const add = (editor: ToolEditor) =>
+export type Input = typeof Input.Type
+
+/** The tool's effect, separate from permission handling so it can be exercised directly. */
+export const apply = (input: Input) => {
+  if (input.action === "remove") {
+    const removed = input.id !== undefined && ModelRoute.removeAdjustment(input.id)
+    return {
+      output: { adjustments: ModelRoute.activeAdjustments() },
+      content: removed ? `Removed ${input.id}` : "No such adjustment",
+    }
+  }
+  if (input.action === "add") {
+    if (!input.match || !input.effect || !input.hours)
+      return {
+        output: { adjustments: ModelRoute.activeAdjustments() },
+        content: "Adding needs match, effect and hours.",
+      }
+    const item: ModelRoute.Adjustment = {
+      id: input.id ?? `${input.effect}-${input.match}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-"),
+      match: input.match,
+      action: input.effect,
+      ...(input.effect === "weight" ? { factor: input.factor ?? 2 } : {}),
+      until: Date.now() + input.hours * 3_600_000,
+      note: input.note,
+    }
+    ModelRoute.addAdjustment(item, input.note)
+    return { output: { adjustments: ModelRoute.activeAdjustments() }, content: `Recorded ${describe(item)}` }
+  }
+  const active = ModelRoute.activeAdjustments()
+  return {
+    output: { adjustments: active },
+    content: active.length ? active.map(describe).join("\n") : "No active adjustments.",
+  }
+}
+
+/** Registered only while model routes are configured, so other setups carry no extra tool. Changing
+ * adjustments needs the same approval as any other tool that alters behaviour. */
+export const add = (editor: ToolEditor, permission: Permission.Interface) =>
   editor.add({
     name,
     options: { codemode: false },
     description,
     input: Input,
     output: Output,
-    execute: (input) =>
-      Effect.sync(() => {
-        if (input.action === "remove") {
-          const removed = input.id !== undefined && ModelRoute.removeAdjustment(input.id)
-          return {
-            output: { adjustments: ModelRoute.activeAdjustments() },
-            content: removed ? `Removed ${input.id}` : "No such adjustment",
-          }
-        }
-        if (input.action === "add") {
-          if (!input.match || !input.effect || !input.hours)
-            return {
-              output: { adjustments: ModelRoute.activeAdjustments() },
-              content: "Adding needs match, effect and hours.",
-            }
-          const item: ModelRoute.Adjustment = {
-            id: input.id ?? `${input.effect}-${input.match}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-"),
-            match: input.match,
-            action: input.effect,
-            ...(input.effect === "weight" ? { factor: input.factor ?? 2 } : {}),
-            until: Date.now() + input.hours * 3_600_000,
-            note: input.note,
-          }
-          ModelRoute.addAdjustment(item, input.note)
-          return {
-            output: { adjustments: ModelRoute.activeAdjustments() },
-            content: `Recorded ${describe(item)}`,
-          }
-        }
-        const active = ModelRoute.activeAdjustments()
-        return {
-          output: { adjustments: active },
-          content: active.length ? active.map(describe).join("\n") : "No active adjustments.",
-        }
-      }),
+    execute: (input, context) =>
+      (input.action === "list"
+        ? Effect.void
+        : permission
+            .assert({
+              action: name,
+              resources: [input.match ?? input.id ?? "*"],
+              sessionID: context.sessionID,
+              agent: context.agent,
+              source: { type: "tool", messageID: context.messageID, id: context.id },
+            })
+            .pipe(Effect.mapError((error) => new ToolFailure({ message: `Permission denied: ${name}`, error })))
+      ).pipe(Effect.andThen(Effect.sync(() => apply(input)))),
   })

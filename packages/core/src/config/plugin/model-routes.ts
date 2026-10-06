@@ -10,6 +10,7 @@ import { Model } from "../../model.js"
 import { ModelRoute } from "../../model-route.js"
 import { Provider } from "../../provider.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
+import { Permission } from "../../permission.js"
 import { RouteAdjustTool } from "../../tool/plugin/route-adjust.js"
 
 type SourceModel = {
@@ -26,6 +27,7 @@ export const Plugin = define({
   id: "opencode.config.model-routes",
   effect: Effect.fn(function* (ctx) {
     const config = yield* Config.Service
+    const permission = yield* Permission.Service
     const loaded = yield* ConfigEntryObserver.observe(
       config,
       ctx.event,
@@ -33,7 +35,7 @@ export const Plugin = define({
     )
 
     yield* ctx.tool.transform((editor) => {
-      if (configuredRoutes(loaded.entries).size > 0) RouteAdjustTool.add(editor)
+      if (configuredRoutes(loaded.entries).size > 0) RouteAdjustTool.add(editor, permission)
     })
 
     yield* ctx.provider.transform((providers) => {
