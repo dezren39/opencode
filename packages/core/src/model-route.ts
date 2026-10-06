@@ -51,6 +51,7 @@ const Definition = Schema.Struct({
   targetVariants: Schema.Array(TargetVariant),
   health: Policy,
   attempts: Schema.Finite.pipe(optional),
+  hedgeAfterMs: Schema.Finite.pipe(optional),
   /** Parallel to `targets`; an empty object means unlimited. */
   budgets: Schema.Array(Budget).pipe(optional),
   nodes: Schema.Array(Node),
@@ -205,6 +206,21 @@ export const failed = (target: Model.Ref, policy: Policy, now = Date.now(), hint
     hint?.retryAfterMs ? "retry-after" : hint?.quota ? "quota" : "failure",
     state.cooldownUntil,
   )
+}
+
+/** Counts a request that was given up on for being slow, so a target that keeps losing hedges
+ * eventually cools down like any other slow one. */
+export const slow = (target: Model.Ref, policy: Policy, now = Date.now()) => {
+  const state = entry(target)
+  recover(target, state, now)
+  if (state.cooldownUntil > now) return
+  state.samples.push(true)
+  if (state.samples.length > policy.sampleWindow) state.samples.shift()
+  if (state.samples.filter(Boolean).length >= policy.slowThreshold) {
+    state.samples = []
+    state.cooldownUntil = now + policy.cooldownMs
+    logHealth(target, "cooldown-start", "slow", state.cooldownUntil)
+  }
 }
 
 export const completed = (

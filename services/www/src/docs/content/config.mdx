@@ -286,14 +286,41 @@ Set `attempts` (default 1) to retry a target that many times before the route
 moves on. Retries only happen before any output, so a tool call never runs
 twice. A target that fails is not penalized until its attempts are used up.
 
+Set `hedgeAfterMs` to guard against a target that is slow rather than down. If the
+current target has produced no output after that long, the same request is sent to
+the next target and the first to answer wins; the other is cancelled. Both run
+unseen, so nothing is shown and no tool runs until a winner is known. It costs a
+duplicate request whenever the first target is slow, and a target that keeps
+losing counts as slow and cools down. It is off by default.
+
+A provider's own timing is believed: a rate limit's `retry-after` sets the
+cooldown (up to a day), and a target that reports an exhausted quota is skipped
+for `quotaCooldownMs` (default 15 minutes) instead of being probed every minute.
+
+`budgets` give a target request and token allowances (`requestsPerMinute`,
+`requestsPerDay`, `tokensPerMinute`, `tokensPerDay`). A target that reaches
+`softLimit` of any allowance (default 0.9) is passed over until the window frees
+up, so traffic moves before the provider starts refusing it. Lower `softLimit` to
+move earlier. When a target appears in nested routes, the outermost route's budget
+applies. Usage is counted from every request OpenCode sends the target, including
+ones made outside a route, and is rebuilt from the database after a restart.
+
 Failures are also correlated. When two or more models of one provider are
 cooling, the whole provider is demoted to last resort until they recover. When
 three or more unrelated providers fail within 30 seconds, the cause is more
 likely your network than any one target, so no target is cooled.
 
-While routes are configured, the `route_adjust` tool lets you tell the agent
+While routes are configured, the `route_stats` tool lets the agent read how targets
+have performed: attempts, failures, first-output latency, speed, current cooldowns
+and usage, and failures grouped by exact error code and HTTP status with the latest
+provider message. It also suggests adjustments from that history (a high failure
+rate, repeated quota errors, unusually slow first output); with `apply` they are put
+in force for 30 minutes, only ever lowering a target's share or skipping it.
+
+The `route_adjust` tool lets you tell the agent
 things like "my Anthropic promo credits expire in 3 days, favor Claude" or "skip
-glm today". It records an expiring adjustment: `weight` with a factor, or
+glm today". Changing adjustments asks for permission like any other tool. It
+records an expiring adjustment: `weight` with a factor, or
 `skip`, matched by a case-insensitive substring of `provider/model`. Ordered
 groups try favored targets first, weighted groups scale their share, and a
 skipped target is only used when nothing else is available. Adjustments survive

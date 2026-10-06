@@ -221,27 +221,32 @@ const layer = Layer.effect(
           continue
         }
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
-        const transcript = SessionModelRequest.baseTranscript({
-          agent: loaded.agent.info,
-          model: loaded.model,
-          tools: loaded.tools,
-          initial: loaded.initial,
-          messages: loaded.messages,
-        })
-        const prepared = yield* context.request.primary({
-          session: loaded.session,
-          agent: loaded.agent.id,
-          model: loaded.model,
-          tools: loaded.tools,
-          system: transcript.system,
-          messages: stepLimitReached
-            ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
-            : transcript.messages,
-          // Keep tool definitions on the final Step to preserve the provider's cached prefix.
-          toolChoice: stepLimitReached ? "none" : undefined,
-          webSocket: "session",
-          inputTokens: SessionCompaction.estimatePrompt(loaded),
-        })
+        // The request depends on the model (system prompt, provider options), so a hedge to another
+        // target of the route is prepared separately rather than reusing this one.
+        const prepareFor = (model: SessionContext.Loaded["model"]) => {
+          const transcript = SessionModelRequest.baseTranscript({
+            agent: loaded.agent.info,
+            model,
+            tools: loaded.tools,
+            initial: loaded.initial,
+            messages: loaded.messages,
+          })
+          return context.request.primary({
+            session: loaded.session,
+            agent: loaded.agent.id,
+            model,
+            tools: loaded.tools,
+            system: transcript.system,
+            messages: stepLimitReached
+              ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
+              : transcript.messages,
+            // Keep tool definitions on the final Step to preserve the provider's cached prefix.
+            toolChoice: stepLimitReached ? "none" : undefined,
+            webSocket: "session",
+            inputTokens: SessionCompaction.estimatePrompt(loaded),
+          })
+        }
+        const prepared = yield* prepareFor(loaded.model)
         const outcome = yield* steps.attempt({
           isLocationClosed: lifecycle.isClosed,
           sessionID,
@@ -249,6 +254,7 @@ const layer = Layer.effect(
           agent: loaded.agent.id,
           model: loaded.model,
           prepared,
+          prepareFor,
           retry: (cause, error, proposed) =>
             retry.decide({
               cause,
