@@ -155,3 +155,50 @@ describe("ModelRoute.orderTargets", () => {
     expect(new Set(heads).size).toBe(2)
   })
 })
+
+describe("ModelRoute correlation and adjustments", () => {
+  const policy = ModelRoute.policy({ cooldownMs: 60_000 })
+  const model = (providerID: string, id: string) => ModelRoute.ref({ providerID, model: id })
+
+  test("demotes a provider once several of its models are cooling, but not other providers", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.failed(model("azure", "a"), policy, 1_000)
+    expect(ModelRoute.coolingDown(model("azure", "b"), 1_000)).toBe(false)
+    ModelRoute.failed(model("azure", "c"), policy, 1_000)
+    expect(ModelRoute.coolingDown(model("azure", "b"), 1_000)).toBe(true)
+    expect(ModelRoute.coolingDown(model("openai", "b"), 1_000)).toBe(false)
+    expect(ModelRoute.coolingDown(model("azure", "b"), 62_000)).toBe(false)
+  })
+
+  test("does not punish targets when unrelated providers fail together", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.failed(model("openai", "a"), policy, 1_000)
+    ModelRoute.failed(model("azure", "a"), policy, 2_000)
+    expect(ModelRoute.networkSuspect(2_000)).toBe(false)
+    ModelRoute.failed(model("anthropic", "a"), policy, 3_000)
+    expect(ModelRoute.networkSuspect(3_000)).toBe(true)
+    expect(ModelRoute.coolingDown(model("anthropic", "a"), 3_000)).toBe(false)
+    expect(ModelRoute.networkSuspect(40_000)).toBe(false)
+  })
+
+  test("skip and weight adjustments expire and reorder ordered groups", () => {
+    ModelRoute.resetHealth()
+    const targets = [model("openai", "gpt-6-luna"), model("anthropic", "claude-opus-5")]
+    const definition = {
+      id: "adj",
+      targets,
+      targetVariants: [],
+      health: policy,
+      nodes: [{ selection: "ordered" as const, weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] }],
+    } as unknown as ModelRoute.Definition
+    const now = Date.now()
+    expect(ModelRoute.orderTargets(definition, new Set([0, 1]), "s", true)).toEqual([0, 1])
+    ModelRoute.setAdjustments([{ id: "promo", match: "claude", action: "weight", factor: 5, until: now + 60_000 }])
+    expect(ModelRoute.orderTargets(definition, new Set([0, 1]), "s", true)).toEqual([1, 0])
+    ModelRoute.setAdjustments([{ id: "promo", match: "claude", action: "weight", factor: 5, until: now - 1 }])
+    expect(ModelRoute.orderTargets(definition, new Set([0, 1]), "s", true)).toEqual([0, 1])
+    ModelRoute.setAdjustments([{ id: "out", match: "openai/", action: "skip", until: now + 60_000 }])
+    expect(ModelRoute.skipped(targets[0])).toBe(true)
+    expect(ModelRoute.skipped(targets[1])).toBe(false)
+  })
+})

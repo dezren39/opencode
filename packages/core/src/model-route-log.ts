@@ -1,19 +1,21 @@
 export * as ModelRouteLog from "./model-route-log.js"
 
-import { and, count, desc, eq, gte, sql } from "drizzle-orm"
+import { and, asc, count, desc, eq, gt, gte, isNull, or, sql } from "drizzle-orm"
 import { Effect, Layer, Queue } from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Database } from "./database/database.js"
-import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable } from "./model-route-log/sql.js"
+import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable, RouteNoteTable } from "./model-route-log/sql.js"
 
 export type Decision = typeof RouteDecisionTable.$inferInsert
 export type Attempt = typeof RouteAttemptTable.$inferInsert
 export type Health = typeof RouteHealthTable.$inferInsert
+export type Note = typeof RouteNoteTable.$inferInsert
 
 export type Event =
   | { readonly kind: "decision"; readonly row: Decision }
   | { readonly kind: "attempt"; readonly row: Attempt }
   | { readonly kind: "health"; readonly row: Health }
+  | { readonly kind: "note"; readonly row: Note }
 
 type Sink = (event: Event) => void
 
@@ -63,11 +65,29 @@ const persist = (db: Database.Interface["db"], events: readonly Event[]) =>
     if (decisions.length) yield* db.insert(RouteDecisionTable).values(decisions).run()
     if (attempts.length) yield* db.insert(RouteAttemptTable).values(attempts).run()
     if (health.length) yield* db.insert(RouteHealthTable).values(health).run()
+    const notes = events.flatMap((event) => (event.kind === "note" ? [event.row] : []))
+    if (notes.length) yield* db.insert(RouteNoteTable).values(notes).run()
   })
+
+/** Receives the still-active adjustments stored by earlier runs. Set by the routing module, which
+ * this one cannot import without a cycle. */
+let restore: ((notes: readonly Record<string, unknown>[]) => void) | undefined
+
+export const onRestore = (next: typeof restore) => {
+  restore = next
+}
 
 const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
+    const stored = yield* db
+      .select()
+      .from(RouteNoteTable)
+      .where(or(isNull(RouteNoteTable.expires), gt(RouteNoteTable.expires, Date.now())))
+      .orderBy(asc(RouteNoteTable.time))
+      .all()
+      .pipe(Effect.orElseSucceed(() => []))
+    restore?.(stored.flatMap((row) => (row.interpreted ? [row.interpreted] : [])))
     const queue = yield* Queue.unbounded<Event>()
     setSink((event) => void Queue.offerUnsafe(queue, event))
     yield* Effect.addFinalizer(() => Effect.sync(() => setSink(undefined)))
