@@ -12,6 +12,7 @@ import { Provider } from "../../provider.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
 import { Permission } from "../../permission.js"
 import { RouteAdjustTool } from "../../tool/plugin/route-adjust.js"
+import { RouteStatsTool } from "../../tool/plugin/route-stats.js"
 
 type SourceModel = {
   readonly ref: Model.Ref
@@ -36,7 +37,9 @@ export const Plugin = define({
     )
 
     yield* ctx.tool.transform((editor) => {
-      if (configuredRoutes(loaded.entries).size > 0) RouteAdjustTool.add(editor, permission)
+      if (configuredRoutes(loaded.entries).size === 0) return
+      RouteAdjustTool.add(editor, permission)
+      RouteStatsTool.add(editor, permission)
     })
 
     yield* ctx.provider.transform((providers) => {

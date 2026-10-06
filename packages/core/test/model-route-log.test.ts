@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import { Database } from "@opencode/core/database/database"
 import { ModelRoute } from "@opencode/core/model-route"
 import { ModelRouteLog } from "@opencode/core/model-route-log"
+import { RouteStatsTool } from "@opencode/core/tool/plugin/route-stats"
 import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable } from "@opencode/core/model-route-log/sql"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { testEffect } from "./lib/effect"
@@ -140,6 +141,46 @@ describe("route usage restore", () => {
         requests: 1,
         tokens: 20,
       })
+    }),
+  )
+})
+
+describe("route stats tool", () => {
+  it.live("reports per-target stats and exact errors, and suggests from them", () =>
+    Effect.gen(function* () {
+      ModelRoute.resetHealth()
+      const now = Date.now()
+      for (let index = 0; index < 6; index++)
+        ModelRouteLog.record({
+          kind: "attempt",
+          row: attempt({
+            provider_id: "flaky",
+            model_id: "m",
+            time_started: now - 1_000 - index,
+            time_ended: now - index,
+            outcome: index < 4 ? "failure" : "success",
+            output_started: index >= 4,
+            ...(index < 4
+              ? ModelRouteLog.failureFields({
+                  _tag: "ProviderInternal",
+                  message: `upstream said no ${index}`,
+                  http: { status: 503, headers: {} },
+                })
+              : {}),
+          }),
+        })
+      yield* Effect.sleep("100 millis")
+
+      const report = yield* RouteStatsTool.collect({ hours: 1 })
+      const flaky = report.targets.find((row) => row.providerID === "flaky")
+      expect(flaky).toMatchObject({ attempts: 6, failures: 4 })
+      expect(report.errors.find((error) => error.providerID === "flaky")).toMatchObject({
+        tag: "ProviderInternal",
+        status: 503,
+        count: 4,
+      })
+      expect(report.errors.find((error) => error.providerID === "flaky")?.lastMessage).toStartWith("upstream said no")
+      expect(report.suggestions.map((item) => item.match)).toContain("flaky/m")
     }),
   )
 })
