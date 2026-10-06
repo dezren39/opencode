@@ -100,6 +100,20 @@ export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
     }),
 }) {}
 
+/** Periodic, automatic use of the routing history. Off by default. */
+export class Tuning extends Schema.Class<Tuning>("Config.ModelRoute.Tuning")({
+  enabled: Schema.Boolean.pipe(optional).annotate({
+    description:
+      "Review routing history on a schedule and put the resulting adjustments in force without asking. They only lower a target's share or skip it, and lapse on their own. Defaults to false.",
+  }),
+  intervalMinutes: PositiveInt.check(Schema.isLessThanOrEqualTo(1440)).pipe(optional).annotate({
+    description: "Minutes between reviews. Defaults to 15.",
+  }),
+  windowHours: PositiveInt.check(Schema.isLessThanOrEqualTo(336)).pipe(optional).annotate({
+    description: "How much history each review looks at. Defaults to 24.",
+  }),
+}) {}
+
 const RouteID = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/))
 
 export const Info = Schema.Record(RouteID, Route).annotate({ identifier: "Config.ModelRoutes" })

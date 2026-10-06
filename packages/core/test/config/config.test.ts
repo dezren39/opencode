@@ -838,6 +838,14 @@ describe("Config", () => {
     expect(migrateV1({ experimental: { subagent_depth: 2 } }).experimental?.subagent_depth).toBe(2)
   })
 
+  test("normalizes scheduled route tuning inside experimental config", () => {
+    const migrated = migrateV1({
+      experimental: { model_route_tuning: { enabled: true, intervalMinutes: 30, windowHours: 12 } },
+    })
+    expect(migrated.experimental?.model_route_tuning).toEqual({ enabled: true, intervalMinutes: 30, windowHours: 12 })
+    expect(migrateV1({ experimental: { model_route_tuning: { intervalMinutes: 0 } } }).experimental).toBeUndefined()
+  })
+
   test("normalizes ordered model routes inside experimental config", () => {
     const migrated = migrateV1({
       experimental: {

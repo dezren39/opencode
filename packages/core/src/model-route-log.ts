@@ -84,6 +84,40 @@ export const onRestoreUsage = (next: typeof restoreUsage) => {
   restoreUsage = next
 }
 
+type CooldownRow = { providerID: string; modelID: string; until: number }
+let restoreCooldowns: ((rows: readonly CooldownRow[]) => void) | undefined
+
+export const onRestoreCooldowns = (next: typeof restoreCooldowns) => {
+  restoreCooldowns = next
+}
+
+/** Cooldowns still in force, rebuilt from the health history so a restart does not send traffic
+ * straight back to a target that was just failing. */
+export const restoreCooldownsFrom = (db: Database.Interface["db"]) =>
+  Effect.gen(function* () {
+    const now = Date.now()
+    const rows = yield* db
+      .select()
+      .from(RouteHealthTable)
+      .where(
+        and(
+          gte(RouteHealthTable.time, now - 86_400_000),
+          or(eq(RouteHealthTable.kind, "cooldown-start"), eq(RouteHealthTable.kind, "cooldown-end")),
+        ),
+      )
+      .orderBy(asc(RouteHealthTable.time), asc(RouteHealthTable.id))
+      .all()
+      .pipe(Effect.orElseSucceed(() => []))
+    const latest = new Map<string, CooldownRow>()
+    for (const row of rows) {
+      const id = `${row.provider_id}/${row.model_id}`
+      if (row.kind === "cooldown-end") latest.delete(id)
+      else if (row.until !== null)
+        latest.set(id, { providerID: row.provider_id, modelID: row.model_id, until: row.until })
+    }
+    restoreCooldowns?.([...latest.values()].filter((row) => row.until > now))
+  })
+
 /** Usage of the last day, so budgets survive a restart. */
 export const restoreUsageFrom = (db: Database.Interface["db"]) =>
   Effect.gen(function* () {
@@ -136,6 +170,7 @@ const layer = Layer.effectDiscard(
     yield* Effect.addFinalizer(() => Effect.sync(() => void (activeDb = undefined)))
     yield* restoreNotes(db)
     yield* restoreUsageFrom(db)
+    yield* restoreCooldownsFrom(db)
     const queue = yield* Queue.unbounded<Event>()
     setSink((event) => void Queue.offerUnsafe(queue, event))
     yield* Effect.addFinalizer(() => Effect.sync(() => setSink(undefined)))

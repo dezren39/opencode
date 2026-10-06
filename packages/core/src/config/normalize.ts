@@ -431,6 +431,15 @@ function normalizeExperimental(
         )
         if (value !== undefined) result.subagent_depth = value
       }
+      if (own(experimental, "model_route_tuning")) {
+        const value = decodeEncoded(
+          ConfigExperimental.Info.fields.model_route_tuning,
+          experimental.model_route_tuning,
+          ["experimental", "model_route_tuning"],
+          diagnostics,
+        )
+        if (value !== undefined) result.model_route_tuning = value
+      }
       if (own(experimental, "model_routes")) {
         const value = decodeMap(
           experimental.model_routes,

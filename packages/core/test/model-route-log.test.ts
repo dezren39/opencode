@@ -241,3 +241,37 @@ describe("route stats tool permission", () => {
     }),
   )
 })
+
+describe("cooldown restore", () => {
+  it.live("rebuilds cooldowns that are still running, and only those", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      ModelRoute.resetHealth()
+      const now = Date.now()
+      const health = (model_id: string, kind: string, time: number, until?: number) =>
+        ModelRouteLog.record({
+          kind: "health",
+          // One provider per target: two cooling models of a provider would demote the provider itself.
+          row: { time, provider_id: `restart-${model_id}`, model_id: "m", kind, until },
+        })
+      health("running", "cooldown-start", now - 5_000, now + 60_000)
+      health("elapsed", "cooldown-start", now - 120_000, now - 60_000)
+      health("recovered", "cooldown-start", now - 10_000, now + 60_000)
+      health("recovered", "cooldown-end", now - 5_000)
+      health("extended", "cooldown-start", now - 20_000, now + 10_000)
+      health("extended", "cooldown-start", now - 5_000, now + 90_000)
+      yield* Effect.sleep("100 millis")
+
+      yield* ModelRouteLog.restoreCooldownsFrom(db)
+      const cooling = (name: string) =>
+        ModelRoute.coolingDown(ModelRoute.ref({ providerID: `restart-${name}`, model: "m" }))
+      expect(cooling("running")).toBe(true)
+      expect(cooling("elapsed")).toBe(false)
+      expect(cooling("recovered")).toBe(false)
+      expect(cooling("extended")).toBe(true)
+      expect(ModelRoute.cooldownUntil(ModelRoute.ref({ providerID: "restart-extended", model: "m" }))).toBe(
+        now + 90_000,
+      )
+    }),
+  )
+})
