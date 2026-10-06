@@ -77,9 +77,9 @@ export const onRestore = (next: typeof restore) => {
   restore = next
 }
 
-const layer = Layer.effectDiscard(
+/** Hands still-active stored notes to the routing module. Runs when the node starts. */
+export const restoreNotes = (db: Database.Interface["db"]) =>
   Effect.gen(function* () {
-    const db = (yield* Database.Service).db
     const stored = yield* db
       .select()
       .from(RouteNoteTable)
@@ -88,6 +88,12 @@ const layer = Layer.effectDiscard(
       .all()
       .pipe(Effect.orElseSucceed(() => []))
     restore?.(stored.flatMap((row) => (row.interpreted ? [row.interpreted] : [])))
+  })
+
+const layer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const db = (yield* Database.Service).db
+    yield* restoreNotes(db)
     const queue = yield* Queue.unbounded<Event>()
     setSink((event) => void Queue.offerUnsafe(queue, event))
     yield* Effect.addFinalizer(() => Effect.sync(() => setSink(undefined)))

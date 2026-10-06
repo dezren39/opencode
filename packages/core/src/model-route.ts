@@ -16,6 +16,8 @@ const Policy = Schema.Struct({
   sampleWindow: PositiveInt,
   slowThreshold: PositiveInt,
   cooldownMs: PositiveInt,
+  /** Cooldown after the provider reports an exhausted quota without saying when it resets. */
+  quotaCooldownMs: PositiveInt,
 })
 
 const TargetVariant = Schema.Struct({
@@ -51,6 +53,7 @@ const DEFAULT_POLICY: Policy = {
   sampleWindow: 5,
   slowThreshold: 3,
   cooldownMs: 60_000,
+  quotaCooldownMs: 900_000,
 }
 
 export const policy = (input?: {
@@ -60,6 +63,7 @@ export const policy = (input?: {
   readonly sampleWindow?: number
   readonly slowThreshold?: number
   readonly cooldownMs?: number
+  readonly quotaCooldownMs?: number
 }): Policy => {
   const sampleWindow = Math.min(input?.sampleWindow ?? DEFAULT_POLICY.sampleWindow, 50)
   return {
@@ -69,6 +73,7 @@ export const policy = (input?: {
     sampleWindow,
     slowThreshold: Math.min(input?.slowThreshold ?? DEFAULT_POLICY.slowThreshold, sampleWindow),
     cooldownMs: Math.min(input?.cooldownMs ?? DEFAULT_POLICY.cooldownMs, 3_600_000),
+    quotaCooldownMs: Math.min(input?.quotaCooldownMs ?? DEFAULT_POLICY.quotaCooldownMs, 86_400_000),
   }
 }
 
@@ -153,7 +158,16 @@ export const cooldownUntil = (target: Model.Ref, now = Date.now()) => {
   return Math.max(state?.cooldownUntil ?? 0, providerCooldownUntil(target.providerID, now))
 }
 
-export const failed = (target: Model.Ref, policy: Policy, now = Date.now()) => {
+const MAX_COOLDOWN_MS = 86_400_000
+
+/** Why a request failed, as far as the cooldown is concerned: a provider that says when it recovers
+ * is believed, an exhausted quota outlasts an ordinary error. */
+export interface FailureHint {
+  readonly retryAfterMs?: number
+  readonly quota?: boolean
+}
+
+export const failed = (target: Model.Ref, policy: Policy, now = Date.now(), hint?: FailureHint) => {
   recentFailures.push({ provider: target.providerID, time: now })
   while (recentFailures.length > 200 || (recentFailures[0] && now - recentFailures[0].time > NETWORK_WINDOW_MS))
     recentFailures.shift()
@@ -163,8 +177,19 @@ export const failed = (target: Model.Ref, policy: Policy, now = Date.now()) => {
   }
   const state = entry(target)
   state.samples = []
-  state.cooldownUntil = now + policy.cooldownMs
-  logHealth(target, "cooldown-start", "failure", state.cooldownUntil)
+  const cooldown =
+    hint?.retryAfterMs !== undefined && hint.retryAfterMs > 0
+      ? Math.min(Math.max(hint.retryAfterMs, 1_000), MAX_COOLDOWN_MS)
+      : hint?.quota
+        ? policy.quotaCooldownMs
+        : policy.cooldownMs
+  state.cooldownUntil = now + cooldown
+  logHealth(
+    target,
+    "cooldown-start",
+    hint?.retryAfterMs ? "retry-after" : hint?.quota ? "quota" : "failure",
+    state.cooldownUntil,
+  )
 }
 
 export const completed = (

@@ -546,6 +546,53 @@ describe("LocationServiceMap", () => {
     ),
   )
 
+  it.live("exposes configured model routes and the route_adjust tool only where routes exist", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
+      (dirs) => Effect.promise(() => Promise.all(dirs.map((dir) => dir[Symbol.asyncDispose]())).then(() => undefined)),
+    ).pipe(
+      Effect.flatMap(([routed, plain]) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            fs.writeFile(
+              path.join(routed.path, "opencode.json"),
+              JSON.stringify({
+                providers: { pool: { name: "Pool", package: "test-provider", models: { one: {}, two: {} } } },
+                experimental: {
+                  model_routes: {
+                    best: { name: "Best", targets: ["pool/one", "pool/two"], selection: "round-robin", attempts: 2 },
+                  },
+                },
+              }),
+            ),
+          )
+          const inspect = (directory: string) =>
+            Effect.gen(function* () {
+              yield* Reference.Service
+              const plugins = yield* Plugin.Service
+              yield* plugins.awaitActivation
+              return {
+                providers: (yield* (yield* Provider.Service).all()).map((provider) => provider.id),
+                tools: (yield* toolDefinitions(yield* Tool.Service)).map((tool) => tool.name),
+              }
+            }).pipe(
+              Effect.scoped,
+              Effect.provide(
+                LocationServiceMap.Service.get(Location.Ref.make({ directory: AbsolutePath.make(directory) })),
+              ),
+            )
+
+          const withRoutes = yield* inspect(routed.path)
+          expect(withRoutes.providers.map(String)).toContain("opencode-route")
+          expect(withRoutes.tools).toContain("route_adjust")
+          const without = yield* inspect(plain.path)
+          expect(without.providers.map(String)).not.toContain("opencode-route")
+          expect(without.tools).not.toContain("route_adjust")
+        }),
+      ),
+    ),
+  )
+
   it.live("rejects an unavailable selected model during location model resolution", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),

@@ -50,6 +50,10 @@ export class Health extends Schema.Class<Health>("Config.ModelRoute.Health")({
   cooldownMs: BoundedPositiveInt.pipe(optional).annotate({
     description: "How long a failed or degraded target is skipped. Defaults to 60000.",
   }),
+  quotaCooldownMs: BoundedPositiveInt.pipe(optional).annotate({
+    description:
+      "How long a target is skipped after the provider reports an exhausted quota without saying when it resets. A reported retry-after always wins. Defaults to 900000.",
+  }),
 }) {}
 
 export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
