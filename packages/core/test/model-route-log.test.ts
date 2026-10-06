@@ -1,7 +1,8 @@
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Exit } from "effect"
 import { Database } from "@opencode/core/database/database"
 import { ModelRoute } from "@opencode/core/model-route"
+import { Permission } from "@opencode/core/permission"
 import { ModelRouteLog } from "@opencode/core/model-route-log"
 import { RouteStatsTool } from "@opencode/core/tool/plugin/route-stats"
 import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable } from "@opencode/core/model-route-log/sql"
@@ -181,6 +182,62 @@ describe("route stats tool", () => {
       })
       expect(report.errors.find((error) => error.providerID === "flaky")?.lastMessage).toStartWith("upstream said no")
       expect(report.suggestions.map((item) => item.match)).toContain("flaky/m")
+    }),
+  )
+})
+
+describe("route stats tool permission", () => {
+  it.live("applying suggestions needs approval; reading does not", () =>
+    Effect.gen(function* () {
+      ModelRoute.resetHealth()
+      const now = Date.now()
+      for (let index = 0; index < 6; index++)
+        ModelRouteLog.record({
+          kind: "attempt",
+          row: attempt({
+            provider_id: "denied",
+            model_id: "m",
+            time_started: now - 1_000 - index,
+            time_ended: now - index,
+            outcome: "failure",
+            output_started: false,
+          }),
+        })
+      yield* Effect.sleep("100 millis")
+
+      const asked: unknown[] = []
+      const register = (allow: boolean) => {
+        let tool: { execute: (input: never, context: never) => Effect.Effect<unknown, unknown> } | undefined
+        RouteStatsTool.add(
+          { add: (added: unknown) => (tool = added as typeof tool) } as never,
+          {
+            assert: (input: unknown) =>
+              Effect.sync(() => asked.push(input)).pipe(
+                Effect.andThen(
+                  allow
+                    ? Effect.void
+                    : Effect.fail(new Permission.BlockedError({ rules: [], permission: "route_stats", resources: [] })),
+                ),
+              ),
+          } as never,
+        )
+        return (input: RouteStatsTool.Input) =>
+          tool!.execute(input as never, { sessionID: "ses_x", agent: "build", messageID: "m", id: "c" } as never)
+      }
+
+      const read = yield* register(false)({ hours: 1 }).pipe(Effect.exit)
+      expect(Exit.isSuccess(read)).toBe(true)
+      expect(asked).toHaveLength(0)
+      expect(ModelRoute.activeAdjustments()).toEqual([])
+
+      const refused = yield* register(false)({ hours: 1, apply: true }).pipe(Effect.exit)
+      expect(Exit.isFailure(refused)).toBe(true)
+      expect(asked).toHaveLength(1)
+      expect(ModelRoute.activeAdjustments()).toEqual([])
+
+      const approved = yield* register(true)({ hours: 1, apply: true }).pipe(Effect.exit)
+      expect(Exit.isSuccess(approved)).toBe(true)
+      expect(ModelRoute.activeAdjustments().map((item) => item.id)).toContain("auto:denied/m")
     }),
   )
 })
