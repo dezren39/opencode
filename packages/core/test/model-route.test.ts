@@ -113,3 +113,45 @@ describe("ModelRoute session selection", () => {
     expect(ModelRoute.sessionTarget("f", "s1")).toBeUndefined()
   })
 })
+
+describe("ModelRoute.orderTargets", () => {
+  const targets = [0, 1, 2, 3].map((index) => ModelRoute.ref({ providerID: "p", model: `m${index}` }))
+  // root: weighted 3:1 between group A (leaves 0,1 round-robin) and leaf 2; leaf 3 is a fallback.
+  const definition = {
+    id: "tree",
+    targets,
+    targetVariants: [],
+    health: ModelRoute.policy(),
+    nodes: [
+      {
+        selection: "weighted" as const,
+        weights: [3, 1, 1],
+        children: [{ node: 1 }, { leaf: 2 }, { leaf: 3 }],
+      },
+      { selection: "round-robin" as const, weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] },
+    ],
+  } as unknown as ModelRoute.Definition
+  const all = new Set([0, 1, 2, 3])
+
+  test("keeps every leaf and splits within the chosen group", () => {
+    const first = ModelRoute.orderTargets(definition, all, "s1", true)
+    expect([...first].sort()).toEqual([0, 1, 2, 3])
+    // Group A's leaves stay adjacent: a group is chosen as one unit.
+    const groupA = first.filter((index) => index < 2)
+    expect(Math.abs(first.indexOf(groupA[0]) - first.indexOf(groupA[1]))).toBe(1)
+  })
+
+  test("is sticky per session at every level and drops cooled groups", () => {
+    const first = ModelRoute.orderTargets(definition, all, "s2", true)
+    expect(ModelRoute.orderTargets(definition, all, "s2", true)).toEqual(first)
+    const withoutA = ModelRoute.orderTargets(definition, new Set([2, 3]), "s2", true)
+    expect(withoutA.filter((index) => index < 2)).toEqual([])
+    expect(withoutA).toHaveLength(2)
+  })
+
+  test("round-robin inside a group rotates across sessions", () => {
+    const onlyA = new Set([0, 1])
+    const heads = ["a", "b", "c", "d"].map((id) => ModelRoute.orderTargets(definition, onlyA, id, true)[0])
+    expect(new Set(heads).size).toBe(2)
+  })
+})

@@ -424,42 +424,23 @@ export const layer = Layer.effect(
       selected: Info,
       definition: ModelRoute.Definition,
       requestedVariant: VariantID | undefined,
-      startIndex: number,
+      tried: ReadonlySet<number>,
       allowCooling: boolean,
       sessionID?: string,
     ): Effect.Effect<Resolved | undefined, Error> =>
       Effect.gen(function* () {
         const now = Date.now()
-        const indexes = definition.targets.flatMap((_, index) => (index >= startIndex ? [index] : []))
+        const indexes = definition.targets.flatMap((_, index) => (tried.has(index) ? [] : [index]))
         const ready = indexes.filter((index) => !ModelRoute.coolingDown(definition.targets[index], now))
-        let candidates = allowCooling
-          ? ready.length > 0
-            ? ready
-            : indexes.toSorted(
+        // When everything is cooling, fall back to the soonest-recovering target rather than failing.
+        const candidates =
+          allowCooling && ready.length === 0
+            ? indexes.toSorted(
                 (left, right) =>
                   ModelRoute.cooldownUntil(definition.targets[left], now) -
                   ModelRoute.cooldownUntil(definition.targets[right], now),
               )
-          : ready
-        // A session keeps the target it drew when it first used the route; failover still walks
-        // the remaining targets in order.
-        if (sessionID && startIndex === 0 && allowCooling && candidates.length > 1) {
-          const sticky = ModelRoute.sessionTarget(definition.id, sessionID)
-          if (sticky !== undefined && candidates.includes(sticky)) {
-            candidates = [sticky, ...candidates.filter((index) => index !== sticky)]
-          } else if (ModelRoute.sessionScoped(definition.selection)) {
-            const drawn = ModelRoute.selectSessionTarget(
-              definition.id,
-              sessionID,
-              definition.selection,
-              candidates,
-              definition.weights,
-            )
-            if (drawn !== undefined && drawn !== candidates[0]) {
-              candidates = [drawn, ...candidates.filter((index) => index !== drawn)]
-            }
-          }
-        }
+            : ModelRoute.orderTargets(definition, new Set(ready), sessionID, allowCooling && tried.size === 0)
 
         let lastError: Error | undefined
         for (const index of candidates) {
@@ -488,7 +469,8 @@ export const layer = Layer.effect(
               routeID: definition.id,
               target: current.ref,
               policy: definition.health,
-              fallback: () => resolveRoute(selected, definition, requestedVariant, index + 1, false, sessionID),
+              fallback: () =>
+                resolveRoute(selected, definition, requestedVariant, new Set([...tried, index]), false, sessionID),
             },
           }
         }
@@ -510,7 +492,7 @@ export const layer = Layer.effect(
             variant: requestedVariant,
           }),
         )
-      return resolveRoute(selected, definition, requestedVariant, 0, true, sessionID).pipe(
+      return resolveRoute(selected, definition, requestedVariant, new Set(), true, sessionID).pipe(
         Effect.flatMap((resolved) =>
           resolved ? Effect.succeed(resolved) : Effect.fail(new RouteUnavailableError({ routeID: selected.id })),
         ),

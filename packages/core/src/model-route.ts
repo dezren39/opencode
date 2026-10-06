@@ -22,15 +22,25 @@ const TargetVariant = Schema.Struct({
   map: Schema.Record(Schema.String, Model.VariantID).pipe(optional),
 })
 
+const Mode = Schema.Literals(["ordered", "round-robin", "weighted"])
+
+/** A group of targets with its own selection mode. Children are leaf target indexes or nested
+ * groups; `weights` is parallel to `children`. Group 0 is the route itself. */
+const Node = Schema.Struct({
+  selection: Mode,
+  weights: Schema.Array(Schema.Finite.check(Schema.isGreaterThan(0))),
+  children: Schema.Array(Schema.Struct({ leaf: Schema.Finite.pipe(optional), node: Schema.Finite.pipe(optional) })),
+})
+
 const Definition = Schema.Struct({
   id: Model.ID,
   targets: Schema.Array(Model.Ref),
   targetVariants: Schema.Array(TargetVariant),
   health: Policy,
-  selection: Schema.Literals(["ordered", "round-robin", "weighted"]),
-  weights: Schema.Array(Schema.Finite.check(Schema.isGreaterThan(0))),
+  nodes: Schema.Array(Node),
 })
 
+export type Node = typeof Node.Type
 export type Policy = typeof Policy.Type
 export type Definition = typeof Definition.Type
 
@@ -203,6 +213,46 @@ export const selectSessionTarget = (
     state.sessions.delete(oldest)
   }
   return chosen
+}
+
+/** Walks the group tree into an ordered list of leaf target indexes. Each group puts its chosen
+ * child first (sticky per session, drawn only when `draw` is set) and keeps the rest in config
+ * order, so failover walks siblings before leaving the group's parent. Groups with no ready leaf
+ * drop out and their weight is redistributed. */
+export const orderTargets = (
+  definition: Definition,
+  ready: ReadonlySet<number>,
+  sessionID: string | undefined,
+  draw: boolean,
+): number[] => {
+  const walk = (nodeIndex: number): number[][] => {
+    const node = definition.nodes[nodeIndex]
+    if (!node) return []
+    const groups = node.children.map((child) =>
+      child.leaf !== undefined
+        ? ready.has(child.leaf)
+          ? [child.leaf]
+          : []
+        : child.node !== undefined
+          ? walk(child.node).flat()
+          : [],
+    )
+    const positions = groups.flatMap((group, position) => (group.length > 0 ? [position] : []))
+    let ordered = positions
+    if (sessionID && sessionScoped(node.selection) && positions.length > 1) {
+      const key = `${definition.id}#${nodeIndex}`
+      const sticky = sessionTarget(key, sessionID)
+      const chosen =
+        sticky !== undefined && positions.includes(sticky)
+          ? sticky
+          : draw
+            ? selectSessionTarget(key, sessionID, node.selection, positions, node.weights)
+            : undefined
+      if (chosen !== undefined) ordered = [chosen, ...positions.filter((position) => position !== chosen)]
+    }
+    return ordered.map((position) => groups[position])
+  }
+  return walk(0).flat()
 }
 
 /** Drops a session's sticky choice, e.g. when its model selection leaves the route. Test seam. */

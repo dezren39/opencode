@@ -35,12 +35,10 @@ export const Plugin = define({
         providers.list().map((record) => [record.provider.id, record.models] as const),
       )
       const models = Array.from(routes, ([id, route]) => {
-        const expanded = expand(id, routes, definitions)
+        const { leaves: expanded, nodes } = expand(id, routes, definitions)
         if (expanded.length === 0) return undefined
         const first = expanded[0].model
         const health = ModelRoute.policy(route.health)
-        const selection = route.selection ?? "ordered"
-        const weights = expanded.map((target) => route.weights?.[`${target.ref.providerID}/${target.ref.id}`] ?? 1)
         const info = Model.Info.make({
           ...Model.Info.default(ModelRoute.PROVIDER_ID, Model.ID.make(id)),
           name: route.name?.trim() || id,
@@ -53,8 +51,7 @@ export const Plugin = define({
                 ...(target.variantMap ? { map: target.variantMap } : {}),
               })),
               health,
-              selection,
-              weights,
+              nodes,
             },
           },
           capabilities: {
@@ -105,22 +102,41 @@ function expand(
   definitions: ReadonlyMap<Provider.ID, ReadonlyMap<string, Model.Info>>,
 ) {
   const result: SourceModel[] = []
+  const nodes: ModelRoute.Node[] = []
   const seen = new Set<string>()
 
-  const visit = (routeID: string, inheritedVariant: Model.VariantID | undefined, trail: ReadonlySet<string>) => {
+  // Each route becomes a group node with its own selection mode and weights, so a weighted route
+  // nested in another is chosen as one unit and then splits among its own members.
+  const visit = (
+    routeID: string,
+    inheritedVariant: Model.VariantID | undefined,
+    trail: ReadonlySet<string>,
+  ): number | undefined => {
     if (trail.has(routeID)) return
     const current = routes.get(routeID)
     if (!current) return
     const nextTrail = new Set(trail).add(routeID)
+    const nodeIndex = nodes.length
+    const node: {
+      selection: ModelRoute.Node["selection"]
+      weights: number[]
+      children: ModelRoute.Node["children"][number][]
+    } = {
+      selection: current.selection ?? "ordered",
+      weights: [],
+      children: [],
+    }
+    nodes.push(node)
+    const attach = (child: ModelRoute.Node["children"][number], key: string) => {
+      node.children.push(child)
+      node.weights.push(current.weights?.[key] ?? 1)
+    }
     for (const target of current.targets) {
       const spec = targetSpec(target)
       const ref = targetRef(spec.model)
       if (ref.providerID === ModelRoute.PROVIDER_ID) {
-        if (ref.variant) {
-          visit(ref.id, ref.variant, nextTrail)
-          continue
-        }
-        visit(ref.id, inheritedVariant, nextTrail)
+        const child = visit(ref.id, ref.variant ?? inheritedVariant, nextTrail)
+        if (child !== undefined) attach({ node: child }, `${ModelRoute.PROVIDER_ID}/${ref.id}`)
         continue
       }
       const model = definitions.get(ref.providerID)?.get(ref.id)
@@ -144,6 +160,7 @@ function expand(
           model.variants.some((item) => item.id === to) ? [[from, Model.VariantID.make(to)] as const] : [],
         ),
       )
+      attach({ leaf: result.length }, `${resolved.providerID}/${resolved.id}`)
       result.push({
         ref: resolved,
         model,
@@ -152,10 +169,11 @@ function expand(
         ...(Object.keys(variantMap).length ? { variantMap } : {}),
       })
     }
+    return node.children.length > 0 ? nodeIndex : undefined
   }
 
   visit(id, undefined, new Set())
-  return result
+  return { leaves: result, nodes }
 }
 
 function targetSpec(target: ConfigModelRoutes.Target) {
