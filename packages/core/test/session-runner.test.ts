@@ -74,6 +74,7 @@ import { ReferenceInstructions } from "@opencode/core/reference/instructions"
 import { McpInstructions } from "@opencode/core/mcp/instructions"
 import { SessionSystemPrompt } from "@opencode/core/session/system-prompt"
 import { ID, Model } from "@opencode/core/model"
+import { ModelRoute } from "@opencode/core/model-route"
 import { Location } from "@opencode/core/location"
 import { Provider } from "@opencode/core/provider"
 import { Cause, Context, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Scope, Stream } from "effect"
@@ -209,6 +210,8 @@ const makeRunnerState = (compaction?: SessionRunnerModel.Resolved["compaction"])
     }).pipe(Effect.andThen(Deferred.succeed(barrier.release, undefined)), Effect.asVoid)
   return {
     currentModel: model,
+    /** Makes the resolved model a routed one. */
+    routing: undefined as SessionRunnerModel.Resolved["routing"],
     compaction,
     modelResolveHook: resolvesModel,
     systemBaseline: "Initial context",
@@ -330,6 +333,7 @@ const layer = Layer.unwrap(
               limit: modelLimits.get(String(selected.id)) ?? defaultModelLimit,
               variant: session.model?.variant,
               compaction: state.compaction,
+              routing: state.routing,
             })
           }),
         ),
@@ -978,6 +982,65 @@ const watchRename = Effect.fnUntraced(function* (sessionID: Session.ID) {
 })
 
 describe("SessionRunnerLLM", () => {
+  scenario("hedges a silent routed model to the next target and answers from the faster one", function* (s) {
+    ModelRoute.resetHealth()
+    const options = {
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      cost: [],
+      limit: defaultModelLimit,
+    } as const
+    const backup = SessionRunnerModel.resolved(replacementModel, options)
+    s.routing = {
+      routeID: Model.ID.make("pool"),
+      target: ModelRoute.ref({ providerID: "fake", model: "fake-model" }),
+      policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
+      attempts: 1,
+      hedgeAfterMs: 100,
+      fallback: () => Effect.succeed(backup),
+    }
+    yield* s.admit("Say something")
+    yield* s.llm.push(TestLLM.hangAfter())
+    yield* s.llm.push(TestLLM.text("from the backup", "t1"))
+
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    for (let index = 0; index < 6; index++) yield* TestClock.adjust("50 millis")
+    yield* Fiber.join(run)
+
+    const requests = s.requests
+    expect(requests).toHaveLength(2)
+    expect(String(requests[1]?.model.id)).toBe("replacement")
+    const assistant = requireAssistant(yield* s.messages)
+    expect(JSON.stringify(assistant)).toContain("from the backup")
+    expect(JSON.stringify(assistant)).not.toContain("error")
+    // The silent primary is only counted as slow once, so it is not cooled.
+    expect(ModelRoute.coolingDown(s.routing.target)).toBe(false)
+  })
+
+  scenario("does not hedge a routed model that answers before the hedge delay", function* (s) {
+    ModelRoute.resetHealth()
+    const options = {
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      cost: [],
+      limit: defaultModelLimit,
+    } as const
+    let started = 0
+    s.routing = {
+      routeID: Model.ID.make("pool"),
+      target: ModelRoute.ref({ providerID: "fake", model: "fake-model" }),
+      policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
+      attempts: 1,
+      hedgeAfterMs: 100,
+      fallback: () => Effect.sync(() => (started++, SessionRunnerModel.resolved(replacementModel, options))),
+    }
+    yield* s.admit("Say something")
+    yield* s.llm.push(TestLLM.text("from the primary", "t1"))
+    yield* s.resume
+
+    expect(s.requests).toHaveLength(1)
+    expect(started).toBe(0)
+    expect(JSON.stringify(requireAssistant(yield* s.messages))).toContain("from the primary")
+  })
+
   scenario("generates the title while the first model step is still running", function* (s) {
     yield* prepareTitleGeneration
 

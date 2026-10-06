@@ -70,10 +70,24 @@ interface Input {
 
 /** Failed attempts per assistant message and target, so a route can retry a target before failing over. */
 const failedAttempts = new Map<string, number>()
-const FAILED_ATTEMPT_LIMIT = 1_000
+export const FAILED_ATTEMPT_LIMIT = 1_000
+
+/** Notes one more failed attempt for the key and returns how many there now are. Oldest keys are
+ * dropped so abandoned turns cannot grow the map without bound. */
+export const countFailedAttempt = (key: string) => {
+  const count = (failedAttempts.get(key) ?? 0) + 1
+  failedAttempts.set(key, count)
+  while (failedAttempts.size > FAILED_ATTEMPT_LIMIT) failedAttempts.delete(failedAttempts.keys().next().value!)
+  return count
+}
+
+export const failedAttemptCount = (key?: string) =>
+  key === undefined ? failedAttempts.size : (failedAttempts.get(key) ?? 0)
+
+export const clearFailedAttempt = (key: string) => failedAttempts.delete(key)
 
 /** Cooldown input from a provider error: a stated retry-after, or an exhausted quota. */
-const failureHint = (failure: AIError): ModelRoute.FailureHint => {
+export const failureHint = (failure: AIError): ModelRoute.FailureHint => {
   const reason = failure.reason as { _tag: string; retryAfterMs?: number; rateLimit?: { retryAfterMs?: number } }
   return {
     retryAfterMs: reason.retryAfterMs ?? reason.rateLimit?.retryAfterMs,
@@ -304,9 +318,8 @@ export const make = Effect.gen(function* () {
           retry?.retry === true &&
           (failedAttempts.get(retryKey) ?? 0) + 1 < input.model.routing.attempts
         if (sameTargetRetry) {
-          failedAttempts.set(retryKey, (failedAttempts.get(retryKey) ?? 0) + 1)
-          while (failedAttempts.size > FAILED_ATTEMPT_LIMIT) failedAttempts.delete(failedAttempts.keys().next().value!)
-        } else failedAttempts.delete(retryKey)
+          countFailedAttempt(retryKey)
+        } else clearFailedAttempt(retryKey)
         if (input.model.routing && llmFailure && failureError && routeFailure && !sameTargetRetry) {
           ModelRoute.failed(input.model.routing.target, input.model.routing.policy, Date.now(), failureHint(llmFailure))
           if (!recorded.outputStarted && retry?.retry) {
