@@ -225,3 +225,38 @@ describe("ModelRoute failure hints", () => {
     expect(ModelRoute.cooldownUntil(t, 1_000)).toBe(1_000 + 60_000)
   })
 })
+
+describe("ModelRoute budgets", () => {
+  const t = ModelRoute.ref({ providerID: "openai", model: "budgeted" })
+
+  test("passes a target over once it reaches its soft limit, and frees it as the window moves", () => {
+    ModelRoute.resetHealth()
+    const budget = { requestsPerMinute: 10, softLimit: 0.5 }
+    const start = 1_000_000
+    for (let index = 0; index < 4; index++) ModelRoute.recordUsage(t, 100, start + index * 1_000)
+    expect(ModelRoute.overBudget(t, budget, start + 5_000)).toBe(false)
+    ModelRoute.recordUsage(t, 100, start + 5_000)
+    expect(ModelRoute.overBudget(t, budget, start + 6_000)).toBe(true)
+    expect(ModelRoute.usageOf(t, start + 6_000).minute).toEqual({ requests: 5, tokens: 500 })
+    expect(ModelRoute.overBudget(t, budget, start + 70_000)).toBe(false)
+    expect(ModelRoute.usageOf(t, start + 70_000).day.requests).toBe(5)
+  })
+
+  test("counts daily tokens and expires them after a day", () => {
+    ModelRoute.resetHealth()
+    const budget = { tokensPerDay: 1_000 }
+    ModelRoute.recordUsage(t, 950, 1_000)
+    expect(ModelRoute.overBudget(t, budget, 2_000)).toBe(true)
+    expect(ModelRoute.overBudget(t, budget, 1_000 + 86_400_000 + 1)).toBe(false)
+    expect(ModelRoute.overBudget(t, undefined, 2_000)).toBe(false)
+  })
+
+  test("seeds usage from stored history in order", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.seedUsage([
+      { time: 3_000, providerID: "openai", modelID: "budgeted", tokens: 30 },
+      { time: 1_000, providerID: "openai", modelID: "budgeted", tokens: 10 },
+    ])
+    expect(ModelRoute.usageOf(t, 4_000).day).toEqual({ requests: 2, tokens: 40 })
+  })
+})

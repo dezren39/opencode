@@ -441,7 +441,8 @@ export const layer = Layer.effect(
         const ready = indexes.filter(
           (index) =>
             !ModelRoute.coolingDown(definition.targets[index], now) &&
-            !ModelRoute.skipped(definition.targets[index], now),
+            !ModelRoute.skipped(definition.targets[index], now) &&
+            !ModelRoute.overBudget(definition.targets[index], definition.budgets?.[index], now),
         )
         // When everything is cooling, fall back to the soonest-recovering target rather than failing.
         const candidates =
@@ -482,6 +483,9 @@ export const layer = Layer.effect(
               detail: {
                 cooling: indexes
                   .filter((index) => !ready.includes(index))
+                  .map((index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`),
+                overBudget: indexes
+                  .filter((index) => ModelRoute.overBudget(definition.targets[index], definition.budgets?.[index], now))
                   .map((index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`),
               },
             },

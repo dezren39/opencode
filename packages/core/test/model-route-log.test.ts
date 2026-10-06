@@ -105,3 +105,41 @@ describe("route note restore", () => {
     }),
   )
 })
+
+describe("route usage restore", () => {
+  it.live("rebuilds the last day of usage from stored attempts", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      ModelRoute.resetHealth()
+      const now = Date.now()
+      ModelRouteLog.record({
+        kind: "attempt",
+        row: attempt({
+          provider_id: "restored",
+          model_id: "m",
+          time_started: now - 2_000,
+          time_ended: now - 1_000,
+          tokens_input: 10,
+          tokens_output: 5,
+          tokens_reasoning: 5,
+        }),
+      })
+      ModelRouteLog.record({
+        kind: "attempt",
+        row: attempt({
+          provider_id: "restored",
+          model_id: "m",
+          time_started: now - 3 * 86_400_000,
+          time_ended: now - 3 * 86_400_000 + 1_000,
+          tokens_input: 999,
+        }),
+      })
+      yield* Effect.sleep("100 millis")
+      yield* ModelRouteLog.restoreUsageFrom(db)
+      expect(ModelRoute.usageOf(ModelRoute.ref({ providerID: "restored", model: "m" })).day).toEqual({
+        requests: 1,
+        tokens: 20,
+      })
+    }),
+  )
+})

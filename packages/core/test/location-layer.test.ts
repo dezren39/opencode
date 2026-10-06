@@ -33,6 +33,7 @@ import { Location } from "@opencode/core/location"
 import { LocationWatcher } from "@opencode/core/filesystem/location-watcher"
 import { Plugin } from "@opencode/core/plugin"
 import { Model } from "@opencode/core/model"
+import { ModelRoute } from "@opencode/core/model-route"
 import { Project } from "@opencode/core/project"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -560,7 +561,15 @@ describe("LocationServiceMap", () => {
                 providers: { pool: { name: "Pool", package: "test-provider", models: { one: {}, two: {} } } },
                 experimental: {
                   model_routes: {
-                    best: { name: "Best", targets: ["pool/one", "pool/two"], selection: "round-robin", attempts: 2 },
+                    inner: { targets: ["pool/one", "pool/two"], selection: "weighted", weights: { "pool/two": 3 } },
+                    best: {
+                      name: "Best",
+                      targets: ["opencode-route/inner", { model: "pool/one", defaultVariant: "max" }],
+                      selection: "round-robin",
+                      attempts: 2,
+                      health: { cooldownMs: 1000, maxResponseTimeMs: 5000 },
+                      budgets: { "pool/one": { requestsPerDay: 10, softLimit: 0.8 } },
+                    },
                   },
                 },
               }),
@@ -573,6 +582,7 @@ describe("LocationServiceMap", () => {
               yield* plugins.awaitActivation
               return {
                 providers: (yield* (yield* Provider.Service).all()).map((provider) => provider.id),
+                route: yield* (yield* Model.Service).get(ModelRoute.PROVIDER_ID, Model.ID.make("best")),
                 tools: (yield* toolDefinitions(yield* Tool.Service)).map((tool) => tool.name),
               }
             }).pipe(
@@ -585,6 +595,18 @@ describe("LocationServiceMap", () => {
           const withRoutes = yield* inspect(routed.path)
           expect(withRoutes.providers.map(String)).toContain("opencode-route")
           expect(withRoutes.tools).toContain("route_adjust")
+          // What the plugin stores must decode, or the route could never be resolved.
+          const definition = withRoutes.route && ModelRoute.definition(withRoutes.route)
+          expect(definition).toBeDefined()
+          expect(definition?.attempts).toBe(2)
+          expect(definition?.health).toMatchObject({ cooldownMs: 1000, maxResponseTimeMs: 5000 })
+          expect(definition?.targets.map((target) => `${target.providerID}/${target.id}`)).toEqual([
+            "pool/one",
+            "pool/two",
+          ])
+          expect(definition?.budgets?.[0]).toMatchObject({ requestsPerDay: 10, softLimit: 0.8 })
+          expect(definition?.nodes.map((node) => node.selection)).toEqual(["round-robin", "weighted"])
+          expect(definition?.nodes[1].weights).toEqual([1, 3])
           const without = yield* inspect(plain.path)
           expect(without.providers.map(String)).not.toContain("opencode-route")
           expect(without.tools).not.toContain("route_adjust")

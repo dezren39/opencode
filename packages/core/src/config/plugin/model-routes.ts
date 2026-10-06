@@ -20,6 +20,7 @@ type SourceModel = {
   /** Variant used when the route is selected without an explicit one. */
   readonly defaultVariant?: Model.VariantID
   /** Route-level variant → this target's variant. */
+  readonly budget?: ModelRoute.Budget
   readonly variantMap?: Readonly<Record<string, Model.VariantID>>
 }
 
@@ -64,6 +65,7 @@ export const Plugin = define({
               health,
               nodes,
               attempts: route.attempts ?? 1,
+              budgets: expanded.map((target) => target.budget ?? {}),
             },
           },
           capabilities: {
@@ -172,8 +174,15 @@ function expand(
           model.variants.some((item) => item.id === to) ? [[from, Model.VariantID.make(to)] as const] : [],
         ),
       )
-      attach({ leaf: result.length }, `${resolved.providerID}/${resolved.id}`)
+      const leafKey = `${resolved.providerID}/${resolved.id}`
+      attach({ leaf: result.length }, leafKey)
+      // Budgets belong to the target: the outermost route that declares one wins, wherever the
+      // target was first reached.
+      const budget = plainBudget(
+        [...nextTrail].map((id) => routes.get(id)?.budgets?.[leafKey]).find((value) => value !== undefined),
+      )
       result.push({
+        ...(budget ? { budget } : {}),
         ref: resolved,
         model,
         fixedVariant: ref.variant !== undefined || inheritedVariant !== undefined,
@@ -186,6 +195,13 @@ function expand(
 
   visit(id, undefined, new Set())
   return { leaves: result, nodes }
+}
+
+/** Settings are stored as JSON, which has no undefined: keep only the allowances actually set. */
+function plainBudget(budget: ConfigModelRoutes.Budget | undefined): ModelRoute.Budget | undefined {
+  if (!budget) return undefined
+  const entries = Object.entries(budget).filter(([, value]) => typeof value === "number")
+  return entries.length > 0 ? (Object.fromEntries(entries) as ModelRoute.Budget) : undefined
 }
 
 function targetSpec(target: ConfigModelRoutes.Target) {

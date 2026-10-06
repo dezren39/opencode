@@ -77,6 +77,39 @@ export const onRestore = (next: typeof restore) => {
   restore = next
 }
 
+type UsageRow = { time: number; providerID: string; modelID: string; tokens: number }
+let restoreUsage: ((rows: readonly UsageRow[]) => void) | undefined
+
+export const onRestoreUsage = (next: typeof restoreUsage) => {
+  restoreUsage = next
+}
+
+/** Usage of the last day, so budgets survive a restart. */
+export const restoreUsageFrom = (db: Database.Interface["db"]) =>
+  Effect.gen(function* () {
+    const rows = yield* db
+      .select({
+        time: RouteAttemptTable.time_ended,
+        providerID: RouteAttemptTable.provider_id,
+        modelID: RouteAttemptTable.model_id,
+        input: RouteAttemptTable.tokens_input,
+        output: RouteAttemptTable.tokens_output,
+        reasoning: RouteAttemptTable.tokens_reasoning,
+      })
+      .from(RouteAttemptTable)
+      .where(gte(RouteAttemptTable.time_ended, Date.now() - 86_400_000))
+      .all()
+      .pipe(Effect.orElseSucceed(() => []))
+    restoreUsage?.(
+      rows.map((row) => ({
+        time: row.time,
+        providerID: row.providerID,
+        modelID: row.modelID,
+        tokens: (row.input ?? 0) + (row.output ?? 0) + (row.reasoning ?? 0),
+      })),
+    )
+  })
+
 /** Hands still-active stored notes to the routing module. Runs when the node starts. */
 export const restoreNotes = (db: Database.Interface["db"]) =>
   Effect.gen(function* () {
@@ -94,6 +127,7 @@ const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
     yield* restoreNotes(db)
+    yield* restoreUsageFrom(db)
     const queue = yield* Queue.unbounded<Event>()
     setSink((event) => void Queue.offerUnsafe(queue, event))
     yield* Effect.addFinalizer(() => Effect.sync(() => setSink(undefined)))
