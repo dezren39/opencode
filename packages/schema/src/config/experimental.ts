@@ -18,4 +18,7 @@ export class Info extends Schema.Class<Info>("ConfigExperimental.Info")({
   model_routes: ConfigModelRoutes.Info.pipe(optional).annotate({
     description: "Named ordered provider/model routes with failure and performance failover",
   }),
+  model_route_tuning: ConfigModelRoutes.Tuning.pipe(optional).annotate({
+    description: "Scheduled review of routing history that adjusts model routes automatically",
+  }),
 }) {}

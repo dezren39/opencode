@@ -11,6 +11,7 @@ import { ModelRoute } from "../../model-route.js"
 import { Provider } from "../../provider.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
 import { Permission } from "../../permission.js"
+import { ModelRouteTuning } from "../../model-route-tuning.js"
 import { RouteAdjustTool } from "../../tool/plugin/route-adjust.js"
 import { RouteStatsTool } from "../../tool/plugin/route-stats.js"
 
@@ -35,6 +36,9 @@ export const Plugin = define({
       ctx.event,
       ctx.provider.reload().pipe(Effect.andThen(ctx.tool.reload())),
     )
+
+    // Scheduled review of the routing history, off unless configured.
+    yield* ModelRouteTuning.schedule(() => configuredTuning(loaded.entries)).pipe(Effect.forkScoped)
 
     yield* ctx.tool.transform((editor) => {
       if (configuredRoutes(loaded.entries).size === 0) return
@@ -103,6 +107,14 @@ export const Plugin = define({
     })
   }),
 })
+
+function configuredTuning(entries: readonly Entry[]) {
+  return entries
+    .filter((entry): entry is Document => entry.type === "document")
+    .reduce<
+      ModelRouteTuning.Settings | undefined
+    >((found, entry) => entry.info.experimental?.model_route_tuning ?? found, undefined)
+}
 
 function configuredRoutes(entries: readonly Entry[]) {
   const routes = new Map<string, ConfigModelRoutes.Route>()

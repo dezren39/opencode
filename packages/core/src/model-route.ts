@@ -443,6 +443,12 @@ export const removeAdjustment = (id: string) => {
   return existed
 }
 
+/** Re-applies cooldowns that were still running when the process last stopped. */
+export const seedCooldowns = (rows: ReadonlyArray<{ providerID: string; modelID: string; until: number }>) => {
+  for (const row of rows) entry(ref({ providerID: row.providerID, model: row.modelID })).cooldownUntil = row.until
+}
+
+ModelRouteLog.onRestoreCooldowns(seedCooldowns)
 ModelRouteLog.onRestoreUsage(seedUsage)
 
 ModelRouteLog.onRestore((notes) => {

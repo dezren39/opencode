@@ -253,8 +253,9 @@ deadline, degradation after 3 slow completions in a rolling window of 5, and a
 60-second in-memory cooldown. Set `firstTokenTimeoutMs` to `false` to disable
 that deadline. Optional `maxResponseTimeMs` and `minOutputTokensPerSecond`
 thresholds define a slow completed response; omitting both leaves the first
-output deadline as the only performance signal. Cooldowns are local to the
-OpenCode process and are not persisted. A route can reference another route,
+output deadline as the only performance signal. Cooldowns are shared by every
+session in the OpenCode process and are restored from the health history after a
+restart. A route can reference another route,
 and a requested variant is offered only when every target supports it.
 Provider-use policies still apply to the concrete targets; a route only exposes
 models that remain available after those policies run.
@@ -316,6 +317,21 @@ and usage, and failures grouped by exact error code and HTTP status with the lat
 provider message. It also suggests adjustments from that history (a high failure
 rate, repeated quota errors, unusually slow first output); with `apply` they are put
 in force for 30 minutes, only ever lowering a target's share or skipping it.
+
+To have that review happen on its own, enable scheduled tuning:
+
+```jsonc
+{
+  "experimental": {
+    "model_route_tuning": { "enabled": true, "intervalMinutes": 15, "windowHours": 24 },
+  },
+}
+```
+
+Every interval OpenCode reads the last `windowHours` of history and puts the same
+suggestions in force without asking. They only lower a target's share or skip it,
+last two intervals, and are replaced by the next review, so a target that recovers
+returns to full share by itself. Off by default.
 
 The `route_adjust` tool lets you tell the agent
 things like "my Anthropic promo credits expire in 3 days, favor Claude" or "skip
