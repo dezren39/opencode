@@ -8,8 +8,24 @@ const BoundedPositiveInt = PositiveInt.check(Schema.isLessThanOrEqualTo(3_600_00
 const SampleCount = PositiveInt.check(Schema.isLessThanOrEqualTo(50))
 const PositiveFinite = Schema.Finite.check(Schema.isGreaterThan(0))
 
-/** An ordered model target, including an optional provider-specific variant. */
-const Target = ConfigModel.Selection
+/** An ordered model target: either `provider/model`, `provider/model#variant`, or an object with
+ * per-target variant defaults and remaps. */
+const TargetObject = Schema.Struct({
+  model: ConfigModel.Selection.annotate({
+    description: "Provider/model reference. A route may reference another route.",
+  }),
+  defaultVariant: Schema.String.pipe(optional).annotate({
+    description: "Variant used when the route is selected without an explicit variant.",
+  }),
+  variants: Schema.Record(Schema.String, Schema.String).pipe(optional).annotate({
+    description:
+      'Remaps a route-level variant to this target\'s variant, e.g. { "low": "high" } runs this target at high when the route is selected at low.',
+  }),
+})
+export const Target = Schema.Union([ConfigModel.Selection, TargetObject]).annotate({
+  identifier: "Config.ModelRoute.Target",
+})
+export type Target = typeof Target.Type
 
 /** Per-target circuit-breaker and response-performance thresholds. */
 export class Health extends Schema.Class<Health>("Config.ModelRoute.Health")({
@@ -42,6 +58,16 @@ export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
     description: "Ordered provider/model references. A route may include another route reference.",
   }),
   health: Health.pipe(optional),
+  selection: Schema.Literals(["ordered", "round-robin", "weighted"]).pipe(optional).annotate({
+    description:
+      "How a session picks its target: ordered uses the configured order (default), round-robin rotates per new session, weighted draws by weights. Either way the choice is sticky for the session and failover falls through the remaining targets in order.",
+  }),
+  weights: Schema.Record(Schema.String, Schema.Finite.check(Schema.isGreaterThan(0)))
+    .pipe(optional)
+    .annotate({
+      description:
+        'Relative ratios for the weighted selection mode, keyed by target model reference, e.g. { "openai/gpt-6-luna": 3, "github-copilot/gpt-6-luna": 1 } sends about 3/4 of new sessions to the first target. Targets without a weight count as 1.',
+    }),
 }) {}
 
 const RouteID = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/))
