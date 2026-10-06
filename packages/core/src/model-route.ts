@@ -3,6 +3,7 @@ export * as ModelRoute from "./model-route.js"
 import { Model } from "@opencode/schema/model"
 import { Provider } from "@opencode/schema/provider"
 import { Schema } from "effect"
+import { ModelRouteLog } from "./model-route-log.js"
 import { optional, PositiveInt } from "@opencode/schema/schema"
 
 export const PROVIDER_ID = Provider.ID.make("opencode-route")
@@ -98,23 +99,30 @@ const entry = (target: Model.Ref) => {
   return current
 }
 
-const recover = (state: { samples: boolean[]; cooldownUntil: number }, now: number) => {
+const logHealth = (target: Model.Ref, kind: "cooldown-start" | "cooldown-end", reason: string, until?: number) =>
+  ModelRouteLog.record({
+    kind: "health",
+    row: { time: Date.now(), provider_id: target.providerID, model_id: target.id, kind, reason, until },
+  })
+
+const recover = (target: Model.Ref, state: { samples: boolean[]; cooldownUntil: number }, now: number) => {
   if (state.cooldownUntil === 0 || state.cooldownUntil > now) return
   state.cooldownUntil = 0
   state.samples = []
+  logHealth(target, "cooldown-end", "expired")
 }
 
 export const coolingDown = (target: Model.Ref, now = Date.now()) => {
   const state = health.get(key(target))
   if (!state) return false
-  recover(state, now)
+  recover(target, state, now)
   return state.cooldownUntil > now
 }
 
 export const cooldownUntil = (target: Model.Ref, now = Date.now()) => {
   const state = health.get(key(target))
   if (!state) return 0
-  recover(state, now)
+  recover(target, state, now)
   return state.cooldownUntil
 }
 
@@ -122,6 +130,7 @@ export const failed = (target: Model.Ref, policy: Policy, now = Date.now()) => {
   const state = entry(target)
   state.samples = []
   state.cooldownUntil = now + policy.cooldownMs
+  logHealth(target, "cooldown-start", "failure", state.cooldownUntil)
 }
 
 export const completed = (
@@ -131,7 +140,7 @@ export const completed = (
   now = Date.now(),
 ) => {
   const state = entry(target)
-  recover(state, now)
+  recover(target, state, now)
   if (state.cooldownUntil > now) return
   const slow =
     (typeof policy.firstTokenTimeoutMs === "number" && sample.firstTokenMs > policy.firstTokenTimeoutMs) ||
@@ -142,6 +151,7 @@ export const completed = (
   if (state.samples.filter(Boolean).length >= policy.slowThreshold) {
     state.samples = []
     state.cooldownUntil = now + policy.cooldownMs
+    logHealth(target, "cooldown-start", "slow", state.cooldownUntil)
   }
 }
 

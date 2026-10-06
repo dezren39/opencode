@@ -28,6 +28,7 @@ import { SessionSchema } from "../schema.js"
 import { toSessionError } from "../to-session-error.js"
 import { SessionUsage } from "../usage.js"
 import { ModelRoute } from "../../model-route.js"
+import { ModelRouteLog } from "../../model-route-log.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
 import { SessionRunnerRetry } from "./retry.js"
@@ -76,6 +77,7 @@ export const make = Effect.gen(function* () {
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
     const startSnapshot = yield* snapshots.capture()
     const requestStarted = performance.now()
+    const wallStarted = Date.now()
     const firstOutput = yield* Deferred.make<void>()
     const publisher = createLLMEventPublisher(bus, {
       sessionID: input.sessionID,
@@ -325,6 +327,41 @@ export const make = Effect.gen(function* () {
             firstTokenMs: firstOutputAt - requestStarted,
             responseMs: completedAt - requestStarted,
             tokensPerSecond: ((record.finish.tokens.output + record.finish.tokens.reasoning) * 1_000) / outputDuration,
+          })
+        }
+        // Every attempt is logged, routed or not, so provider-wide trouble is visible across models.
+        {
+          const finishedAt = performance.now()
+          const failed = llmFailure !== undefined
+          const timedOut = failed && llmFailure.reason._tag === "Transport" && llmFailure.reason.code === "Timeout"
+          const tokens = record.finish?.tokens
+          ModelRouteLog.record({
+            kind: "attempt",
+            row: {
+              time_started: wallStarted,
+              time_ended: Date.now(),
+              session_id: input.sessionID,
+              assistant_message_id: input.assistantMessageID,
+              route_id: input.model.routing?.routeID ?? "",
+              provider_id: input.model.ref.providerID,
+              model_id: input.model.ref.id,
+              variant: input.model.ref.variant,
+              outcome: streamInterrupted ? "interrupted" : timedOut ? "timeout" : failed ? "failure" : "success",
+              ...(failed ? ModelRouteLog.failureFields(llmFailure.reason) : {}),
+              retryable: failed ? SessionRunnerRetry.isRetryable(llmFailure) : undefined,
+              output_started: record.outputStarted,
+              first_token_ms: firstOutputAt === undefined ? undefined : firstOutputAt - requestStarted,
+              response_ms: finishedAt - requestStarted,
+              tokens_per_second:
+                tokens && firstOutputAt !== undefined
+                  ? ((tokens.output + tokens.reasoning) * 1_000) / Math.max(1, finishedAt - firstOutputAt)
+                  : undefined,
+              tokens_input: tokens?.input,
+              tokens_output: tokens?.output,
+              tokens_reasoning: tokens?.reasoning,
+              tokens_cache_read: tokens?.cache.read,
+              tokens_cache_write: tokens?.cache.write,
+            },
           })
         }
         if (record.finish || record.failure) {
