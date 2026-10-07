@@ -4,6 +4,7 @@ import { Database } from "@opencode/core/database/database"
 import { ModelRoute } from "@opencode/core/model-route"
 import { Permission } from "@opencode/core/permission"
 import { ModelRouteLog } from "@opencode/core/model-route-log"
+import { AIError, QuotaExceededError } from "@opencode/ai"
 import { RouteStatsTool } from "@opencode/core/tool/plugin/route-stats"
 import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable } from "@opencode/core/model-route-log/sql"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -278,10 +279,20 @@ describe("ModelRouteLog.failureFields", () => {
         },
       },
     })
-    expect(fields).not.toHaveProperty("error_body")
+    // The body is opt-in, since it can echo the request.
+    expect(fields.error_body).toBeUndefined()
     expect(JSON.stringify(fields)).not.toContain("private")
     expect(JSON.stringify(fields)).not.toContain("secret")
     expect(JSON.stringify(fields)).not.toContain("may echo")
+    const captured = ModelRouteLog.failureFields(
+      {
+        _tag: "RateLimit",
+        message: "rate limited",
+        body: "may echo request content",
+      },
+      { captureBody: true },
+    )
+    expect(captured.error_body).toBe("may echo request content")
   })
 })
 
@@ -360,6 +371,107 @@ describe("rate-limit window restore", () => {
       const rows = (yield* db.select().from(RouteHealthTable).all()).filter((row) => row.provider_id === "limit-logged")
       expect(rows).toHaveLength(1)
       expect(rows[0]).toMatchObject({ kind: "rate-limit-window", reason: "provider-reported", until: now + 45_000 })
+    }),
+  )
+})
+
+describe("ModelRouteLog.observer", () => {
+  it.live("records every call's attempt, so background generation is not invisible", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const now = Date.now()
+      const observe = ModelRouteLog.observer({
+        routeID: "titles",
+        providerID: "openai",
+        modelID: "small",
+        sessionID: "ses_title",
+        startedAt: now,
+      })
+      observe.done("success", {
+        outputStarted: true,
+        firstOutputAt: now + 12,
+        tokens: { input: 30, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      yield* Effect.sleep("100 millis")
+      const rows = yield* db.select().from(RouteAttemptTable).all()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        route_id: "titles",
+        provider_id: "openai",
+        model_id: "small",
+        outcome: "success",
+        output_started: true,
+        tokens_input: 30,
+        tokens_estimated: false,
+      })
+    }),
+  )
+
+  it.live("records a failed call with the exact error, and bodies when asked", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const failure = new AIError({
+        reason: new QuotaExceededError({ message: "out of quota", body: '{"detail":"try again later"}' }),
+      })
+      ModelRouteLog.observer({
+        routeID: "gen",
+        providerID: "openai",
+        modelID: "m",
+        startedAt: Date.now(),
+        captureBody: true,
+      }).done("failure", { failure, outputStarted: false })
+      yield* Effect.sleep("100 millis")
+      const rows = yield* db.select().from(RouteAttemptTable).all()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        outcome: "failure",
+        error_tag: "QuotaExceeded",
+        error_message: "out of quota",
+        error_body: '{"detail":"try again later"}',
+      })
+    }),
+  )
+
+  it.live("marks both legs of a hedged attempt", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const request = { routeID: "r", providerID: "openai", modelID: "m", startedAt: Date.now(), hedged: true }
+      ModelRouteLog.observer(request).done("success", { outputStarted: true, firstOutputAt: Date.now() })
+      ModelRouteLog.observer(request).done("hedged-out", { outputStarted: false })
+      yield* Effect.sleep("100 millis")
+      const rows = yield* db.select().from(RouteAttemptTable).all()
+      expect(rows.map((row) => [row.outcome, row.hedged]).toSorted()).toEqual([
+        ["hedged-out", true],
+        ["success", true],
+      ])
+    }),
+  )
+})
+
+describe("hedge accuracy", () => {
+  it.live("scores each leg of a hedged pair", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const now = Date.now()
+      const leg = (provider: string, outcome: "success" | "hedged-out") =>
+        ModelRouteLog.observer({
+          routeID: "r",
+          providerID: provider,
+          modelID: "m",
+          assistantMessageID: "msg_hedge",
+          startedAt: now,
+          hedged: true,
+        }).done(outcome, {
+          outputStarted: outcome === "success",
+          firstOutputAt: outcome === "success" ? now : undefined,
+        })
+      leg("openai", "hedged-out")
+      leg("anthropic", "success")
+      yield* Effect.sleep("100 millis")
+      expect(yield* ModelRouteLog.hedgeAccuracy(db, 0)).toMatchObject([
+        { providerID: "anthropic", modelID: "m", hedges: 1, wins: 1 },
+        { providerID: "openai", modelID: "m", hedges: 1, wins: 0 },
+      ])
     }),
   )
 })

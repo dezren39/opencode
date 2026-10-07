@@ -14,6 +14,8 @@ import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
+import { ModelRoute } from "../model-route.js"
+import { ModelRouteLog } from "../model-route-log.js"
 import { SessionUsage } from "./usage.js"
 import { SessionStore } from "./store.js"
 
@@ -54,6 +56,23 @@ export const layer = Layer.effect(
       const chunks: string[] = []
       let failed = false
       let usage: SessionUsage.Recorded | undefined
+      // Rough prompt size for the attempt record: a title request is small, and the provider's own
+      // count replaces this when the response reports usage.
+      const promptText = [input.agent.system ?? "", input.text].join("\n")
+      const observed = ModelRouteLog.observer(
+        {
+          routeID: input.model.routing?.routeID ?? "",
+          providerID: input.model.ref.providerID,
+          modelID: input.model.ref.id,
+          variant: input.model.ref.variant,
+          sessionID: input.session.id,
+          startedAt: Date.now(),
+          inputTokens: Math.ceil(promptText.length / 4) || undefined,
+        },
+        (snapshot) => ModelRoute.observeRateLimit(input.model.ref, snapshot),
+      )
+      let error: unknown
+      let interrupted = false
       const recordUsage = Effect.suspend(() =>
         usage
           ? bus.publish(SessionEvent.UsageRecorded, {
@@ -71,7 +90,7 @@ export const layer = Layer.effect(
         messages: [Message.user(input.text)],
       })
       if (prepared.event.result !== undefined) return prepared.event.result
-      yield* llm.stream(prepared.request, prepared.options).pipe(
+      yield* llm.stream(prepared.request, observed.options(prepared.options)).pipe(
         Stream.runForEach((event) => {
           if (LLMEvent.is.providerError(event)) failed = true
           if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
@@ -81,13 +100,23 @@ export const layer = Layer.effect(
           }
           return Effect.void
         }),
-        Effect.catchTag("AI.Error", () =>
+        Effect.catchTag("AI.Error", (cause) =>
           Effect.sync(() => {
             failed = true
+            error = cause
           }),
         ),
-        Effect.onInterrupt(() => recordUsage.pipe(Effect.asVoid)),
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            interrupted = true
+          }).pipe(Effect.andThen(recordUsage), Effect.asVoid),
+        ),
       )
+      observed.done(interrupted ? "interrupted" : failed ? "failure" : "success", {
+        failure: error,
+        outputStarted: chunks.length > 0,
+        tokens: usage?.tokens,
+      })
       yield* recordUsage
       if (failed) return
       return chunks

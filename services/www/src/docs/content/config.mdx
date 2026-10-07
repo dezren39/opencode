@@ -328,6 +328,30 @@ provider message. It also suggests adjustments from that history (a high failure
 rate, repeated quota errors, unusually slow first output); with `apply` they are put
 in force for 30 minutes, only ever lowering a target's share or skipping it.
 
+The review also looks at _when_ each target tends to fail. A target that has been
+unreliable at the current hour is down-weighted for a while, while one that only
+failed at 3am is left alone at noon. Notes are how the tuner learns what history
+cannot say, one per line as `match: text`:
+
+```jsonc
+{
+  "experimental": {
+    "model_route_tuning": {
+      "enabled": true,
+      "notes": [
+        "anthropic/claude-opus-5: promo credits, reset at 2026-01-04T00:00:00Z",
+        "openai/gpt-6-luna: out of quota, back in 3 hours",
+      ],
+    },
+  },
+}
+```
+
+A note that states when a limit returns (`reset at`, `back in 3 hours`) skips
+matching targets until then. The rest is left for the agent to read: `route_stats`
+returns the notes with the history it covers. The tuner also reads a stated reset
+time out of a provider's own error message when the headers say nothing.
+
 To have that review happen on its own, enable scheduled tuning:
 
 ```jsonc
@@ -351,6 +375,13 @@ records an expiring adjustment: `weight` with a factor, or
 groups try favored targets first, weighted groups scale their share, and a
 skipped target is only used when nothing else is available. Adjustments survive
 restarts until they expire.
+
+Every request is recorded, including background ones such as title generation and
+compaction, so nothing is invisible. A request that never went out, because the
+chosen target could not be resolved, is recorded as `resolution-failure`. Both
+legs of a hedged attempt are marked `hedged`, which is how `route_stats` reports
+hedge accuracy: how often a target won the race it was drawn into. Provider error
+bodies are only kept when a request opts in, since a body can echo the request.
 
 OpenCode records routing history in its database for analysis and tuning:
 `route_decision` (what was eligible, what was drawn and why), `route_attempt`

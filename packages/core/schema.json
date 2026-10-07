@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "2e50448c-1ca2-4512-8e61-32d5c2e711e8",
-  "prevIds": ["697a5a2b-324c-43f9-beec-97eee70d1f08"],
+  "id": "677883c4-8535-45d2-8dc1-757104d5be16",
+  "prevIds": ["2e50448c-1ca2-4512-8e61-32d5c2e711e8"],
   "ddl": [
     {
       "name": "account_state",
@@ -647,6 +647,16 @@
       "table": "route_attempt"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_body",
+      "entityType": "columns",
+      "table": "route_attempt"
+    },
+    {
       "type": "integer",
       "notNull": false,
       "autoincrement": false,
@@ -673,6 +683,16 @@
       "default": null,
       "generated": null,
       "name": "failed_over_to",
+      "entityType": "columns",
+      "table": "route_attempt"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "hedged",
       "entityType": "columns",
       "table": "route_attempt"
     },
