@@ -294,6 +294,16 @@ unseen, so nothing is shown and no tool runs until a winner is known. It costs a
 duplicate request whenever the first target is slow, and a target that keeps
 losing counts as slow and cools down. It is off by default.
 
+OpenCode also reads the rate-limit headers of every response, successful ones
+included (OpenAI-style `x-ratelimit-*` and Anthropic-style `anthropic-ratelimit-*`
+windows, and `retry-after`). A window that is empty, or down to 5% of its
+allowance with a stated reset time, holds the target back until it resets, so
+traffic moves before the provider starts refusing it. This is the provider's own
+forecast, not a failure: nothing is cooled or counted against the target. If every
+target in a route is held back, the first still answers rather than the turn
+failing. Windows survive a restart until they reset, and the latest report for each
+target is stored with its attempt and shown by `route_stats`.
+
 A provider's own timing is believed: a rate limit's `retry-after` sets the
 cooldown (up to a day), and a target that reports an exhausted quota is skipped
 for `quotaCooldownMs` (default 15 minutes) instead of being probed every minute.

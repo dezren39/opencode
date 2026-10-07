@@ -1698,6 +1698,32 @@ describe("ModelResolver routes", () => {
     )
   })
 
+  it.effect("passes over a target whose provider reports a spent rate-limit window", () => {
+    ModelRoute.resetHealth()
+    const a = leaf("pa")
+    const b = leaf("pb")
+    const route = routed([a, b], ordered)
+    const spent = (providerID: string, model: string) =>
+      ModelRoute.observeRateLimit(ModelRoute.ref({ providerID, model }), {
+        at: Date.now(),
+        limit: { requests: "60" },
+        remaining: { requests: "0" },
+        reset: { requests: "1h" },
+      })
+    return withResolver([a, b], (resolver) =>
+      Effect.gen(function* () {
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pa")
+        spent("pa", a.id)
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pb")
+        // Neither is cooling, so the provider's forecast is the only reason pa was passed over.
+        expect(ModelRoute.coolingDown(ModelRoute.ref({ providerID: "pa", model: a.id }))).toBe(false)
+        // With every target spent, the first still answers rather than the turn failing.
+        spent("pb", b.id)
+        expect(targetOf(yield* resolver.resolveModel(route))).toBe("pa")
+      }),
+    )
+  })
+
   it.effect("gives each new session its own target in round-robin mode and keeps it", () => {
     ModelRoute.resetHealth()
     ModelRoute.resetSelection()

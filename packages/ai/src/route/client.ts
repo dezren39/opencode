@@ -12,7 +12,7 @@ import { normalizeToolHistory } from "../tool-history.js"
 import { sanitizeSurrogates } from "../utils/sanitize.js"
 import * as ProviderShared from "../protocols/shared.js"
 import { ToolSchemaProjection } from "../protocols/utils/tool-schema.js"
-import type { LanguageModelSanitizerCompatibility, ProtocolID, ProviderOptions } from "../schema/index.js"
+import type { HttpContext, LanguageModelSanitizerCompatibility, ProtocolID, ProviderOptions } from "../schema/index.js"
 import {
   AIError,
   CompactionResponse,
@@ -183,6 +183,10 @@ export interface Interface {
 export interface StreamOptions {
   readonly http?: HttpMiddleware
   readonly webSocket?: WebSocketChannelExecutor
+  /** Called once the provider has answered, before any event is decoded, with the HTTP response
+   * metadata (status and headers). Lets callers read rate-limit details of a successful request.
+   * Not called for transports with no HTTP response. */
+  readonly onResponse?: (http: HttpContext) => void
 }
 
 export interface StreamMethod {
@@ -425,6 +429,13 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
         return Stream.unwrap(
           routeInput.transport.execute(prepared, request, runtime, options).pipe(
             Effect.map((execution) => {
+              if (execution.http) {
+                try {
+                  options?.onResponse?.(execution.http)
+                } catch {
+                  // A caller's observer must never break the stream it observes.
+                }
+              }
               const terminal = protocol.stream.terminal
               // Preserve assembled inputs; replace only serialized event fallbacks with their original wire data.
               const frameError =

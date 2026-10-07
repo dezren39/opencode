@@ -325,3 +325,61 @@ describe("ModelRoute.slow", () => {
     expect(ModelRoute.coolingDown(t, 64_000)).toBe(false)
   })
 })
+
+describe("ModelRoute provider rate limits", () => {
+  const t = ModelRoute.ref({ providerID: "openai", model: "limited" })
+  const spent = (reset: string, now: number) => ({
+    at: now,
+    limit: { requests: "60" },
+    remaining: { requests: "0" },
+    reset: { requests: reset },
+  })
+
+  test("a spent window holds the target back until it resets, without counting as a failure", () => {
+    ModelRoute.resetHealth()
+    const now = 5_000_000
+    ModelRoute.observeRateLimit(t, spent("30s", now), now)
+    expect(ModelRoute.limitedUntil(t, now + 1_000)).toBe(now + 30_000)
+    expect(ModelRoute.coolingDown(t, now + 1_000)).toBe(false)
+    expect(ModelRoute.limitedUntil(t, now + 31_000)).toBe(0)
+  })
+
+  test("a healthy report is remembered but holds nothing", () => {
+    ModelRoute.resetHealth()
+    const now = 5_000_000
+    const healthy = { at: now, limit: { requests: "60" }, remaining: { requests: "59" }, reset: { requests: "1s" } }
+    ModelRoute.observeRateLimit(t, healthy, now)
+    expect(ModelRoute.limitedUntil(t, now)).toBe(0)
+    expect(ModelRoute.rateLimitOf(t)).toEqual(healthy)
+  })
+
+  test("a later healthy report lifts the hold", () => {
+    ModelRoute.resetHealth()
+    const now = 5_000_000
+    ModelRoute.observeRateLimit(t, spent("1h", now), now)
+    expect(ModelRoute.limitedUntil(t, now + 1_000)).toBeGreaterThan(0)
+    ModelRoute.observeRateLimit(
+      t,
+      { at: now + 2_000, limit: { requests: "60" }, remaining: { requests: "60" } },
+      now + 2_000,
+    )
+    expect(ModelRoute.limitedUntil(t, now + 3_000)).toBe(0)
+  })
+
+  test("ignores a response that said nothing and is cleared with the rest of the health state", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.observeRateLimit(t, undefined)
+    expect(ModelRoute.rateLimitOf(t)).toBeUndefined()
+    ModelRoute.observeRateLimit(t, spent("1h", Date.now()))
+    ModelRoute.resetHealth()
+    expect(ModelRoute.limitedUntil(t)).toBe(0)
+    expect(ModelRoute.rateLimitOf(t)).toBeUndefined()
+  })
+
+  test("restored windows hold targets back", () => {
+    ModelRoute.resetHealth()
+    const now = Date.now()
+    ModelRoute.seedLimits([{ providerID: "openai", modelID: "limited", until: now + 60_000 }])
+    expect(ModelRoute.limitedUntil(t, now)).toBe(now + 60_000)
+  })
+})

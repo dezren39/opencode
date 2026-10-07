@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import {
   AIError,
+  HttpRateLimitDetails,
   LanguageModel,
   LLM,
   LLMEvent,
@@ -29,6 +30,7 @@ import { Snapshot } from "@opencode/core/snapshot"
 import { ToolOutput } from "@opencode/core/tool-output"
 import { Money } from "@opencode/schema/money"
 import { ModelRoute } from "@opencode/core/model-route"
+import { ModelRouteLog } from "@opencode/core/model-route-log"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { asc, eq } from "drizzle-orm"
 import { Effect, Exit, Layer } from "effect"
@@ -269,6 +271,9 @@ it.live("hedges to the next target when the first stays silent, and the faster a
     const db = (yield* Database.Service).db
     const llm = yield* TestLLM.Test
     ModelRoute.resetHealth()
+    const logged: ModelRouteLog.Event[] = []
+    ModelRouteLog.setSink((event) => void logged.push(event))
+    yield* Effect.addFinalizer(() => Effect.sync(() => ModelRouteLog.setSink(undefined)))
     const sessionID = Session.ID.create()
     const assistantMessageID = SessionMessage.ID.create()
     const steps = yield* SessionStep.make.pipe(
@@ -369,6 +374,19 @@ it.live("hedges to the next target when the first stays silent, and the faster a
     expect(fallbackCalls).toBe(1)
     // The cancelled primary still cost a request, charged at the prompt-size estimate.
     expect(ModelRoute.usageOf(primary.ref).day).toEqual({ requests: 1, tokens: 1_234 })
+    const attempts = logged.flatMap((event) => (event.kind === "attempt" ? [event.row] : []))
+    const lost = attempts.find((row) => row.outcome === "hedged-out")
+    expect(lost).toMatchObject({
+      provider_id: "openai",
+      model_id: "primary",
+      tokens_input: 1_234,
+      tokens_estimated: true,
+    })
+    expect(attempts.find((row) => row.outcome === "success")).toMatchObject({
+      provider_id: "anthropic",
+      model_id: "backup",
+      tokens_estimated: false,
+    })
   }),
 )
 
@@ -569,212 +587,6 @@ it.effect("cools a target that reports an exhausted quota for the quota cooldown
   }),
 )
 
-it.live("hedges to the next target when the first stays silent, and the faster answer wins", () =>
-  Effect.gen(function* () {
-    const db = (yield* Database.Service).db
-    const llm = yield* TestLLM.Test
-    ModelRoute.resetHealth()
-    const sessionID = Session.ID.create()
-    const assistantMessageID = SessionMessage.ID.create()
-    const steps = yield* SessionStep.make.pipe(
-      Effect.provide(
-        Layer.mock(Snapshot.Service)({
-          capture: () => Effect.succeed(undefined),
-          files: () => Effect.succeed([]),
-        }),
-      ),
-    )
-    yield* db
-      .insert(ProjectTable)
-      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
-      .run()
-    yield* db
-      .insert(SessionTable)
-      .values({
-        id: sessionID,
-        project_id: Project.ID.global,
-        slug: "route-step",
-        directory: "/project",
-        version: "test",
-      })
-      .run()
-
-    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
-    const cost = [
-      {
-        input: Money.USDPerMillionTokens.make(1),
-        output: Money.USDPerMillionTokens.make(2),
-        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
-      },
-    ]
-    const limit = { context: 100_000, output: 1_000 }
-    const primary = SessionRunnerModel.resolved(
-      LanguageModel.make({ id: "primary", provider: "openai", route: OpenAIChat.route }),
-      { capabilities, cost, limit },
-    )
-    const fallback = SessionRunnerModel.resolved(
-      LanguageModel.make({ id: "backup", provider: "anthropic", route: OpenAIChat.route }),
-      { capabilities, cost, limit },
-    )
-    let fallbackCalls = 0
-    const model = SessionRunnerModel.resolved(primary.model, {
-      capabilities,
-      cost,
-      limit,
-      routing: {
-        routeID: Model.ID.make("smart-slow"),
-        target: primary.ref,
-        attempts: 1,
-        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
-        hedgeAfterMs: 60,
-        fallback: () => {
-          fallbackCalls++
-          return Effect.succeed(fallback)
-        },
-      },
-    })
-    yield* llm.push(TestLLM.hangAfter())
-    yield* llm.push(TestLLM.text("from the hedge", "t1"))
-
-    const result = yield* steps
-      .attempt({
-        isLocationClosed: () => false,
-        sessionID,
-        assistantMessageID,
-        agent: Agent.defaultID,
-        model,
-        prepared: {
-          retry: () => Effect.void,
-          request: LLM.request({ model: model.model, prompt: "Check the service" }),
-          options: {},
-          executeTool: () => Effect.die("not used"),
-        },
-        retry: (_cause, _error, retry) =>
-          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
-        prepareFor: (next) =>
-          Effect.succeed({
-            retry: () => Effect.void,
-            request: LLM.request({ model: next.model, prompt: "Check the service" }),
-            options: {},
-            executeTool: () => Effect.die("not used"),
-          }),
-        recoverContinuation: true,
-        recoverOverflow: Effect.succeed(false),
-      })
-      .pipe(Effect.exit)
-
-    expect(Exit.isSuccess(result)).toBe(true)
-    if (Exit.isSuccess(result)) expect(result.value._tag).toBe("Completed")
-    const requests = yield* llm.requests()
-    expect(requests).toHaveLength(2)
-    expect(String(requests[1].model.id)).toBe("backup")
-    // The slow primary is counted as slow but not cooled by a single miss.
-    expect(ModelRoute.coolingDown(primary.ref)).toBe(false)
-    expect(fallbackCalls).toBe(1)
-  }),
-)
-
-it.live("does not hedge when the first target answers in time", () =>
-  Effect.gen(function* () {
-    const db = (yield* Database.Service).db
-    const llm = yield* TestLLM.Test
-    ModelRoute.resetHealth()
-    const sessionID = Session.ID.create()
-    const assistantMessageID = SessionMessage.ID.create()
-    const steps = yield* SessionStep.make.pipe(
-      Effect.provide(
-        Layer.mock(Snapshot.Service)({
-          capture: () => Effect.succeed(undefined),
-          files: () => Effect.succeed([]),
-        }),
-      ),
-    )
-    yield* db
-      .insert(ProjectTable)
-      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
-      .run()
-    yield* db
-      .insert(SessionTable)
-      .values({
-        id: sessionID,
-        project_id: Project.ID.global,
-        slug: "route-step",
-        directory: "/project",
-        version: "test",
-      })
-      .run()
-
-    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
-    const cost = [
-      {
-        input: Money.USDPerMillionTokens.make(1),
-        output: Money.USDPerMillionTokens.make(2),
-        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
-      },
-    ]
-    const limit = { context: 100_000, output: 1_000 }
-    const primary = SessionRunnerModel.resolved(
-      LanguageModel.make({ id: "primary", provider: "openai", route: OpenAIChat.route }),
-      { capabilities, cost, limit },
-    )
-    const fallback = SessionRunnerModel.resolved(
-      LanguageModel.make({ id: "backup", provider: "anthropic", route: OpenAIChat.route }),
-      { capabilities, cost, limit },
-    )
-    let fallbackCalls = 0
-    const model = SessionRunnerModel.resolved(primary.model, {
-      capabilities,
-      cost,
-      limit,
-      routing: {
-        routeID: Model.ID.make("smart-slow"),
-        target: primary.ref,
-        attempts: 1,
-        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
-        hedgeAfterMs: 60,
-        fallback: () => {
-          fallbackCalls++
-          return Effect.succeed(fallback)
-        },
-      },
-    })
-    yield* llm.push(TestLLM.text("from the primary", "t1"))
-    yield* llm.push(TestLLM.text("never used", "t2"))
-
-    const result = yield* steps
-      .attempt({
-        isLocationClosed: () => false,
-        sessionID,
-        assistantMessageID,
-        agent: Agent.defaultID,
-        model,
-        prepared: {
-          retry: () => Effect.void,
-          request: LLM.request({ model: model.model, prompt: "Check the service" }),
-          options: {},
-          executeTool: () => Effect.die("not used"),
-        },
-        retry: (_cause, _error, retry) =>
-          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
-        prepareFor: (next) =>
-          Effect.succeed({
-            retry: () => Effect.void,
-            request: LLM.request({ model: next.model, prompt: "Check the service" }),
-            options: {},
-            executeTool: () => Effect.die("not used"),
-          }),
-        recoverContinuation: true,
-        recoverOverflow: Effect.succeed(false),
-      })
-      .pipe(Effect.exit)
-
-    expect(Exit.isSuccess(result)).toBe(true)
-    if (Exit.isSuccess(result)) expect(result.value._tag).toBe("Completed")
-    expect(yield* llm.requests()).toHaveLength(1)
-    expect(fallbackCalls).toBe(0)
-  }),
-)
-
 it.effect("cools a rate-limited target for exactly what the provider asked", () =>
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
@@ -873,7 +685,7 @@ it.effect("cools a rate-limited target for exactly what the provider asked", () 
   }),
 )
 
-it.live("hedges to the next target when the first stays silent, and the faster answer wins", () =>
+it.effect("holds a rate-limited target until the window the provider reported resets", () =>
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
     const llm = yield* TestLLM.Test
@@ -930,15 +742,26 @@ it.live("hedges to the next target when the first stays silent, and the faster a
         target: primary.ref,
         attempts: 1,
         policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
-        hedgeAfterMs: 60,
         fallback: () => {
           fallbackCalls++
           return Effect.succeed(fallback)
         },
       },
     })
-    yield* llm.push(TestLLM.hangAfter())
-    yield* llm.push(TestLLM.text("from the hedge", "t1"))
+    yield* llm.push(
+      TestLLM.failAfter(
+        new AIError({
+          reason: new RateLimitError({
+            message: "slow down",
+            rateLimit: new HttpRateLimitDetails({
+              limit: { requests: "60" },
+              remaining: { requests: "0" },
+              reset: { requests: "90s" },
+            }),
+          }),
+        }),
+      ),
+    )
 
     const result = yield* steps
       .attempt({
@@ -955,127 +778,21 @@ it.live("hedges to the next target when the first stays silent, and the faster a
         },
         retry: (_cause, _error, retry) =>
           Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
-        prepareFor: (next) =>
-          Effect.succeed({
-            retry: () => Effect.void,
-            request: LLM.request({ model: next.model, prompt: "Check the service" }),
-            options: {},
-            executeTool: () => Effect.die("not used"),
-          }),
         recoverContinuation: true,
         recoverOverflow: Effect.succeed(false),
       })
       .pipe(Effect.exit)
 
     expect(Exit.isSuccess(result)).toBe(true)
-    if (Exit.isSuccess(result)) expect(result.value._tag).toBe("Completed")
-    const requests = yield* llm.requests()
-    expect(requests).toHaveLength(2)
-    expect(String(requests[1].model.id)).toBe("backup")
-    // The slow primary is counted as slow but not cooled by a single miss.
-    expect(ModelRoute.coolingDown(primary.ref)).toBe(false)
+    if (Exit.isSuccess(result))
+      expect(result.value).toEqual(SessionStep.Outcome.Failover({ model: fallback, error: expect.anything() }))
     expect(fallbackCalls).toBe(1)
-  }),
-)
-
-it.live("does not hedge when the first target answers in time", () =>
-  Effect.gen(function* () {
-    const db = (yield* Database.Service).db
-    const llm = yield* TestLLM.Test
-    ModelRoute.resetHealth()
-    const sessionID = Session.ID.create()
-    const assistantMessageID = SessionMessage.ID.create()
-    const steps = yield* SessionStep.make.pipe(
-      Effect.provide(
-        Layer.mock(Snapshot.Service)({
-          capture: () => Effect.succeed(undefined),
-          files: () => Effect.succeed([]),
-        }),
-      ),
-    )
-    yield* db
-      .insert(ProjectTable)
-      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
-      .run()
-    yield* db
-      .insert(SessionTable)
-      .values({
-        id: sessionID,
-        project_id: Project.ID.global,
-        slug: "route-step",
-        directory: "/project",
-        version: "test",
-      })
-      .run()
-
-    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
-    const cost = [
-      {
-        input: Money.USDPerMillionTokens.make(1),
-        output: Money.USDPerMillionTokens.make(2),
-        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
-      },
-    ]
-    const limit = { context: 100_000, output: 1_000 }
-    const primary = SessionRunnerModel.resolved(
-      LanguageModel.make({ id: "primary", provider: "openai", route: OpenAIChat.route }),
-      { capabilities, cost, limit },
-    )
-    const fallback = SessionRunnerModel.resolved(
-      LanguageModel.make({ id: "backup", provider: "anthropic", route: OpenAIChat.route }),
-      { capabilities, cost, limit },
-    )
-    let fallbackCalls = 0
-    const model = SessionRunnerModel.resolved(primary.model, {
-      capabilities,
-      cost,
-      limit,
-      routing: {
-        routeID: Model.ID.make("smart-slow"),
-        target: primary.ref,
-        attempts: 1,
-        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
-        hedgeAfterMs: 60,
-        fallback: () => {
-          fallbackCalls++
-          return Effect.succeed(fallback)
-        },
-      },
-    })
-    yield* llm.push(TestLLM.text("from the primary", "t1"))
-    yield* llm.push(TestLLM.text("never used", "t2"))
-
-    const result = yield* steps
-      .attempt({
-        isLocationClosed: () => false,
-        sessionID,
-        assistantMessageID,
-        agent: Agent.defaultID,
-        model,
-        prepared: {
-          retry: () => Effect.void,
-          request: LLM.request({ model: model.model, prompt: "Check the service" }),
-          options: {},
-          executeTool: () => Effect.die("not used"),
-        },
-        retry: (_cause, _error, retry) =>
-          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
-        prepareFor: (next) =>
-          Effect.succeed({
-            retry: () => Effect.void,
-            request: LLM.request({ model: next.model, prompt: "Check the service" }),
-            options: {},
-            executeTool: () => Effect.die("not used"),
-          }),
-        recoverContinuation: true,
-        recoverOverflow: Effect.succeed(false),
-      })
-      .pipe(Effect.exit)
-
-    expect(Exit.isSuccess(result)).toBe(true)
-    if (Exit.isSuccess(result)) expect(result.value._tag).toBe("Completed")
+    // The default cooldown is a minute; the provider said the window resets in 90 seconds.
+    const held = ModelRoute.limitedUntil(primary.ref) - Date.now()
+    expect(held).toBeGreaterThan(80_000)
+    expect(held).toBeLessThanOrEqual(90_000)
+    expect(ModelRoute.rateLimitOf(primary.ref)?.remaining).toEqual({ requests: "0" })
     expect(yield* llm.requests()).toHaveLength(1)
-    expect(fallbackCalls).toBe(0)
   }),
 )
 
@@ -1268,6 +985,227 @@ it.live("fails over when a routed provider misses the first-output deadline", ()
     if (Exit.isSuccess(result)) expect(result.value._tag).toBe("Failover")
     expect(ModelRoute.coolingDown(primary.ref)).toBe(true)
     expect(yield* llm.requests()).toHaveLength(1)
+  }),
+)
+
+it.effect("records the failed attempt that fails over, with the exact error", () =>
+  Effect.gen(function* () {
+    const db = (yield* Database.Service).db
+    const llm = yield* TestLLM.Test
+    ModelRoute.resetHealth()
+    const logged: ModelRouteLog.Event[] = []
+    ModelRouteLog.setSink((event) => void logged.push(event))
+    yield* Effect.addFinalizer(() => Effect.sync(() => ModelRouteLog.setSink(undefined)))
+    const sessionID = Session.ID.create()
+    const assistantMessageID = SessionMessage.ID.create()
+    const steps = yield* SessionStep.make.pipe(
+      Effect.provide(
+        Layer.mock(Snapshot.Service)({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+        }),
+      ),
+    )
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "route-step",
+        directory: "/project",
+        version: "test",
+      })
+      .run()
+
+    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
+    const cost = [
+      {
+        input: Money.USDPerMillionTokens.make(1),
+        output: Money.USDPerMillionTokens.make(2),
+        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
+      },
+    ]
+    const limit = { context: 100_000, output: 1_000 }
+    const primary = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "primary", provider: "openai", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    const fallback = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "backup", provider: "anthropic", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    let fallbackCalls = 0
+    const model = SessionRunnerModel.resolved(primary.model, {
+      capabilities,
+      cost,
+      limit,
+      routing: {
+        routeID: Model.ID.make("smart-slow"),
+        target: primary.ref,
+        attempts: 1,
+        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
+        fallback: () => {
+          fallbackCalls++
+          return Effect.succeed(fallback)
+        },
+      },
+    })
+    yield* llm.push(
+      TestLLM.failAfter(new AIError({ reason: new ProviderInternalError({ message: "primary unavailable" }) })),
+    )
+
+    const result = yield* steps
+      .attempt({
+        isLocationClosed: () => false,
+        sessionID,
+        assistantMessageID,
+        agent: Agent.defaultID,
+        model,
+        prepared: {
+          retry: () => Effect.void,
+          request: LLM.request({ model: model.model, prompt: "Check the service" }),
+          options: {},
+          executeTool: () => Effect.die("not used"),
+        },
+        retry: (_cause, _error, retry) =>
+          Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
+        recoverContinuation: true,
+        recoverOverflow: Effect.succeed(false),
+      })
+      .pipe(Effect.exit)
+
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result))
+      expect(result.value).toEqual(SessionStep.Outcome.Failover({ model: fallback, error: expect.anything() }))
+    expect(fallbackCalls).toBe(1)
+    const attempts = logged.flatMap((event) => (event.kind === "attempt" ? [event.row] : []))
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]).toMatchObject({
+      route_id: "smart-slow",
+      provider_id: "openai",
+      model_id: "primary",
+      outcome: "failure",
+      error_tag: "ProviderInternal",
+      error_message: "primary unavailable",
+      retryable: true,
+      output_started: false,
+    })
+    expect(yield* llm.requests()).toHaveLength(1)
+  }),
+)
+
+it.effect("records every failed attempt, including the ones that are retried", () =>
+  Effect.gen(function* () {
+    ModelRoute.resetHealth()
+    const logged: ModelRouteLog.Event[] = []
+    ModelRouteLog.setSink((event) => void logged.push(event))
+    yield* Effect.addFinalizer(() => Effect.sync(() => ModelRouteLog.setSink(undefined)))
+    const db = (yield* Database.Service).db
+    const llm = yield* TestLLM.Test
+    const sessionID = Session.ID.create()
+    const assistantMessageID = SessionMessage.ID.create()
+    const steps = yield* SessionStep.make.pipe(
+      Effect.provide(
+        Layer.mock(Snapshot.Service)({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+        }),
+      ),
+    )
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "route-step",
+        directory: "/project",
+        version: "test",
+      })
+      .run()
+
+    const capabilities = { tools: true, input: ["text"], output: ["text"] } as const
+    const cost = [
+      {
+        input: Money.USDPerMillionTokens.make(1),
+        output: Money.USDPerMillionTokens.make(2),
+        cache: { read: Money.USDPerMillionTokens.make(0.1), write: Money.USDPerMillionTokens.make(0.5) },
+      },
+    ]
+    const limit = { context: 100_000, output: 1_000 }
+    const primary = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "primary", provider: "openai", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    const fallback = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "backup", provider: "anthropic", route: OpenAIChat.route }),
+      { capabilities, cost, limit },
+    )
+    let fallbackCalls = 0
+    const model = SessionRunnerModel.resolved(primary.model, {
+      capabilities,
+      cost,
+      limit,
+      routing: {
+        routeID: Model.ID.make("smart-slow"),
+        target: primary.ref,
+        attempts: 2,
+        policy: ModelRoute.policy({ firstTokenTimeoutMs: false }),
+        fallback: () => {
+          fallbackCalls++
+          return Effect.succeed(fallback)
+        },
+      },
+    })
+    for (let index = 0; index < 2; index++)
+      yield* llm.push(
+        TestLLM.failAfter(new AIError({ reason: new ProviderInternalError({ message: "primary unavailable" }) })),
+      )
+
+    const run = () =>
+      steps
+        .attempt({
+          isLocationClosed: () => false,
+          sessionID,
+          assistantMessageID,
+          agent: Agent.defaultID,
+          model,
+          prepared: {
+            retry: () => Effect.void,
+            request: LLM.request({ model: model.model, prompt: "Check the service" }),
+            options: {},
+            executeTool: () => Effect.die("not used"),
+          },
+          retry: (_cause, _error, retry) =>
+            Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
+          recoverContinuation: true,
+          recoverOverflow: Effect.succeed(false),
+        })
+        .pipe(Effect.exit)
+
+    const first = yield* run()
+    expect(Exit.isSuccess(first)).toBe(true)
+    if (Exit.isSuccess(first)) expect(first.value._tag).toBe("Retry")
+    expect(fallbackCalls).toBe(0)
+    expect(ModelRoute.coolingDown(primary.ref)).toBe(false)
+
+    const result = yield* run()
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result))
+      expect(result.value).toEqual(SessionStep.Outcome.Failover({ model: fallback, error: expect.anything() }))
+    expect(fallbackCalls).toBe(1)
+    expect(ModelRoute.coolingDown(primary.ref)).toBe(true)
+    expect(yield* llm.requests()).toHaveLength(2)
+    const attempts = logged.flatMap((event) => (event.kind === "attempt" ? [event.row] : []))
+    expect(attempts.map((row) => row.outcome)).toEqual(["failure", "failure"])
+    expect(attempts.every((row) => row.error_message === "primary unavailable")).toBe(true)
   }),
 )
 

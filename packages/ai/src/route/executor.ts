@@ -77,6 +77,14 @@ const rateLimitDetails = (headers: Record<string, string>, retryAfter: number | 
   })
 }
 
+/** Rate-limit details a response advertises, on success as well as failure. Undefined when it
+ * carries none. Header names are expected lower-cased, as `Headers` holds them. */
+export const responseRateLimit = (headers: Record<string, string>) =>
+  rateLimitDetails(
+    normalizedHeaders(Headers.fromInput(headers)),
+    retryAfterMs(normalizedHeaders(Headers.fromInput(headers))),
+  )
+
 export const responseHttp = (response: HttpClientResponse.HttpClientResponse) =>
   new HttpContext({
     url: response.request.url,

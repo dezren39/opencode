@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "697a5a2b-324c-43f9-beec-97eee70d1f08",
-  "prevIds": ["cf1be9da-a2f2-43ea-ba03-8e994887126a"],
+  "id": "2e50448c-1ca2-4512-8e61-32d5c2e711e8",
+  "prevIds": ["697a5a2b-324c-43f9-beec-97eee70d1f08"],
   "ddl": [
     {
       "name": "account_state",
@@ -643,16 +643,6 @@
       "default": null,
       "generated": null,
       "name": "error_message",
-      "entityType": "columns",
-      "table": "route_attempt"
-    },
-    {
-      "type": "text",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "error_body",
       "entityType": "columns",
       "table": "route_attempt"
     },
