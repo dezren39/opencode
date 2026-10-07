@@ -5,6 +5,7 @@ import { ToolFailure } from "@opencode/ai"
 import { Effect, Option, Schema } from "effect"
 import type { Permission } from "../../permission.js"
 import { ModelRoute } from "../../model-route.js"
+import { ModelRouteLimits } from "../../model-route-limits.js"
 import { ModelRouteLog } from "../../model-route-log.js"
 import { ModelRouteTuning } from "../../model-route-tuning.js"
 
@@ -30,6 +31,18 @@ export const Output = Schema.Struct({
 
 const MESSAGE_LIMIT = 300
 
+/** The provider's reported windows, with how old the report is and when each resets. */
+export const summarizeRateLimit = (snapshot: ModelRouteLimits.Snapshot | undefined, now: number) =>
+  snapshot && {
+    ageSeconds: Math.max(0, Math.round((now - snapshot.at) / 1000)),
+    windows: ModelRouteLimits.windows(snapshot).map((window) => ({
+      name: window.name,
+      remaining: window.remaining,
+      limit: window.limit ?? null,
+      resetsInSeconds: window.resetAt === undefined ? null : Math.max(0, Math.round((window.resetAt - now) / 1000)),
+    })),
+  }
+
 export const collect = (input: Input) =>
   Effect.gen(function* () {
     const now = Date.now()
@@ -47,6 +60,9 @@ export const collect = (input: Input) =>
       return {
         ...row,
         cooldownSeconds: Math.max(0, Math.round((ModelRoute.cooldownUntil(ref, now) - now) / 1000)),
+        // What the provider last said about its rate-limit windows, and how long that holds the target.
+        rateLimit: summarizeRateLimit(ModelRoute.rateLimitOf(ref), now),
+        heldBackSeconds: Math.max(0, Math.round((ModelRoute.limitedUntil(ref, now) - now) / 1000)),
         usedLastMinute: used.minute,
         usedLastDay: used.day,
       }
@@ -61,12 +77,22 @@ export const collect = (input: Input) =>
     }
   })
 
+const rateLimitText = (summary: ReturnType<typeof summarizeRateLimit>) =>
+  summary && summary.windows.length > 0
+    ? `; provider reported ${summary.windows
+        .map(
+          (window) =>
+            `${window.name} ${window.remaining}${window.limit === null ? "" : `/${window.limit}`}${window.resetsInSeconds === null ? "" : ` (resets in ${window.resetsInSeconds}s)`}`,
+        )
+        .join(", ")} ${summary.ageSeconds}s ago`
+    : ""
+
 const describe = (report: Effect.Success<ReturnType<typeof collect>>, applied: number) => {
   if (report.noDatabase) return "Routing history is unavailable: no database is attached."
   const lines = [`${report.targets.length} targets with attempts in the window.`]
   for (const row of report.targets)
     lines.push(
-      `${row.providerID}/${row.modelID}: ${row.attempts} attempts, ${row.failures} failed, ${row.timeouts} timed out, first output ${row.avgFirstTokenMs === null ? "n/a" : `${Math.round(row.avgFirstTokenMs)}ms`}, ${row.avgTokensPerSecond === null ? "n/a" : `${row.avgTokensPerSecond.toFixed(1)} tok/s`}${row.cooldownSeconds > 0 ? `, cooling ${row.cooldownSeconds}s` : ""}; used ${row.usedLastDay.requests} requests / ${row.usedLastDay.tokens} tokens in 24h`,
+      `${row.providerID}/${row.modelID}: ${row.attempts} attempts, ${row.failures} failed, ${row.timeouts} timed out, first output ${row.avgFirstTokenMs === null ? "n/a" : `${Math.round(row.avgFirstTokenMs)}ms`}, ${row.avgTokensPerSecond === null ? "n/a" : `${row.avgTokensPerSecond.toFixed(1)} tok/s`}${row.cooldownSeconds > 0 ? `, cooling ${row.cooldownSeconds}s` : ""}${row.heldBackSeconds > 0 ? `, held back ${row.heldBackSeconds}s by the provider's rate limit` : ""}${rateLimitText(row.rateLimit)}; used ${row.usedLastDay.requests} requests / ${row.usedLastDay.tokens} tokens in 24h`,
     )
   for (const error of report.errors)
     lines.push(

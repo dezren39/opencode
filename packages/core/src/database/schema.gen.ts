@@ -92,7 +92,6 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`error_code\` text,
           \`error_status\` integer,
           \`error_message\` text,
-          \`error_body\` text,
           \`retryable\` integer,
           \`output_started\` integer NOT NULL,
           \`failed_over_to\` text,

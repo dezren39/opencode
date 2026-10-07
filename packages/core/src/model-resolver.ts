@@ -445,10 +445,12 @@ export const layer = Layer.effect(
             const until = ModelRoute.cooldownUntil(target, now)
             const isSkipped = ModelRoute.skipped(target, now)
             const isOverBudget = ModelRoute.overBudget(target, definition.budgets?.[index], now)
+            const limited = ModelRoute.limitedUntil(target, now)
             if (until > now) unavailable.set(index, `cooldown-until:${until}`)
+            else if (limited > now) unavailable.set(index, `provider-limit-until:${limited}`)
             else if (isSkipped) unavailable.set(index, "user-skip")
             else if (isOverBudget) unavailable.set(index, "soft-budget")
-            return until <= now && !isSkipped && !isOverBudget
+            return until <= now && limited <= now && !isSkipped && !isOverBudget
           })
           // Budgets and skips are soft limits: if every remaining target is excluded, try the
           // configured tree as a last resort rather than refusing a turn.

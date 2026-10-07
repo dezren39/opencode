@@ -47,8 +47,6 @@ export const RouteAttemptTable = sqliteTable(
     error_code: text(),
     error_status: integer(),
     error_message: text(),
-    /** The provider's original error response body, untouched. */
-    error_body: text(),
     retryable: integer({ mode: "boolean" }),
     output_started: integer({ mode: "boolean" }).notNull(),
     failed_over_to: text(),

@@ -73,7 +73,6 @@ describe("ModelRouteLog", () => {
         error_message: "You exceeded your current quota",
         quota: { headers: { "x-ratelimit-remaining-tokens": "0", "retry-after": "60" } },
       })
-      expect(attempts.find((row) => row.outcome === "failure")?.error_body).toBeNull()
 
       const stats = yield* ModelRouteLog.targetStats(db, 0, "luna")
       expect(stats).toHaveLength(1)
@@ -316,6 +315,51 @@ describe("cooldown restore", () => {
       expect(ModelRoute.cooldownUntil(ModelRoute.ref({ providerID: "restart-extended", model: "m" }))).toBe(
         now + 90_000,
       )
+    }),
+  )
+})
+
+describe("rate-limit window restore", () => {
+  it.live("holds targets back again after a restart while the provider's window is still open", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      ModelRoute.resetHealth()
+      const now = Date.now()
+      const window = (name: string, time: number, until: number) =>
+        ModelRouteLog.record({
+          kind: "health",
+          row: { time, provider_id: `limit-${name}`, model_id: "m", kind: "rate-limit-window", until },
+        })
+      window("open", now - 5_000, now + 120_000)
+      window("over", now - 200_000, now - 100_000)
+      window("renewed", now - 50_000, now + 10_000)
+      window("renewed", now - 5_000, now + 300_000)
+      yield* Effect.sleep("100 millis")
+
+      yield* ModelRouteLog.restoreCooldownsFrom(db)
+      const until = (name: string) =>
+        ModelRoute.limitedUntil(ModelRoute.ref({ providerID: `limit-${name}`, model: "m" }))
+      expect(until("open")).toBe(now + 120_000)
+      expect(until("over")).toBe(0)
+      expect(until("renewed")).toBe(now + 300_000)
+      // A window is the provider's forecast, not a failure: nothing is cooling.
+      expect(ModelRoute.coolingDown(ModelRoute.ref({ providerID: "limit-open", model: "m" }))).toBe(false)
+    }),
+  )
+
+  it.live("records a spent window as a health event the first time it is seen", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      ModelRoute.resetHealth()
+      const target = ModelRoute.ref({ providerID: "limit-logged", model: "m" })
+      const now = Date.now()
+      const spent = { at: now, remaining: { requests: "0" }, reset: { requests: "45s" } }
+      ModelRoute.observeRateLimit(target, spent, now)
+      ModelRoute.observeRateLimit(target, spent, now + 1_000)
+      yield* Effect.sleep("100 millis")
+      const rows = (yield* db.select().from(RouteHealthTable).all()).filter((row) => row.provider_id === "limit-logged")
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ kind: "rate-limit-window", reason: "provider-reported", until: now + 45_000 })
     }),
   )
 })

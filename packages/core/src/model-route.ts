@@ -3,6 +3,7 @@ export * as ModelRoute from "./model-route.js"
 import { Model } from "@opencode/schema/model"
 import { Provider } from "@opencode/schema/provider"
 import { Schema } from "effect"
+import { ModelRouteLimits } from "./model-route-limits.js"
 import { ModelRouteLog } from "./model-route-log.js"
 import { optional, PositiveInt } from "@opencode/schema/schema"
 
@@ -59,6 +60,8 @@ const Definition = Schema.Struct({
   nodes: Schema.Array(Node),
 })
 
+/** A concrete provider/model a route sends requests to. */
+export type Target = Model.Ref
 export type Node = typeof Node.Type
 export type Policy = typeof Policy.Type
 export type Definition = typeof Definition.Type
@@ -125,7 +128,7 @@ const entry = (target: Model.Ref) => {
 
 const logHealth = (
   target: Model.Ref,
-  kind: "cooldown-start" | "cooldown-end" | "network-suspect",
+  kind: "cooldown-start" | "cooldown-end" | "network-suspect" | "rate-limit-window",
   reason: string,
   until?: number,
 ) =>
@@ -261,6 +264,7 @@ export const completed = (
 
 /** Test seam; health is intentionally process-local and never persists prompts or request contents. */
 export const resetHealth = () => {
+  limits.clear()
   usage.clear()
   adjustments = []
   health.clear()
@@ -427,6 +431,41 @@ export const seedUsage = (
 
 const ModelRoute_ref = (providerID: string, modelID: string) => ref({ providerID, model: modelID })
 
+// What each provider last said about its rate-limit windows, and how long that holds the target
+// back. Kept apart from cooldowns: this is the provider's own forecast, not a failure.
+const limits = new Map<string, { snapshot?: ModelRouteLimits.Snapshot; until: number }>()
+
+/** Records a response's rate-limit snapshot. A spent window holds the target back until it resets. */
+export const observeRateLimit = (
+  target: Model.Ref,
+  snapshot: ModelRouteLimits.Snapshot | undefined,
+  now = Date.now(),
+) => {
+  if (!snapshot) return
+  const id = key(target)
+  const until = ModelRouteLimits.holdUntil(snapshot, now)
+  const previous = limits.get(id)
+  limits.delete(id)
+  limits.set(id, { snapshot, until })
+  while (limits.size > HEALTH_LIMIT) limits.delete(limits.keys().next().value!)
+  if (until > now && (previous?.until ?? 0) < until - 1_000)
+    logHealth(target, "rate-limit-window", "provider-reported", until)
+}
+
+/** Until when the provider's own numbers say to leave the target alone; 0 when they don't. */
+export const limitedUntil = (target: Model.Ref, now = Date.now()) => {
+  const state = limits.get(key(target))
+  return state && state.until > now ? state.until : 0
+}
+
+/** The latest rate-limit snapshot seen for the target, if any. */
+export const rateLimitOf = (target: Model.Ref) => limits.get(key(target))?.snapshot
+
+/** Re-applies windows that were still holding targets back when the process last stopped. */
+export const seedLimits = (rows: ReadonlyArray<{ providerID: string; modelID: string; until: number }>) => {
+  for (const row of rows) limits.set(key(ref({ providerID: row.providerID, model: row.modelID })), { until: row.until })
+}
+
 /** An expiring operator or agent instruction about which targets to use. `match` is a case-insensitive
  * substring of `provider/model`, so "anthropic" or "claude" covers every target that looks like it. */
 export interface Adjustment {
@@ -476,6 +515,7 @@ export const seedCooldowns = (rows: ReadonlyArray<{ providerID: string; modelID:
 }
 
 ModelRouteLog.onRestoreCooldowns(seedCooldowns)
+ModelRouteLog.onRestoreLimits(seedLimits)
 ModelRouteLog.onRestoreUsage(seedUsage)
 
 ModelRouteLog.onRestore((notes) => {

@@ -9,8 +9,10 @@ import {
   TransportError,
   UnknownProviderError,
   type ProviderErrorEvent,
+  type HttpContext,
   type ToolCall,
 } from "@opencode/ai"
+import { RequestExecutor, type StreamOptions } from "@opencode/ai/route"
 import type { Agent } from "@opencode/schema/agent"
 import { Cause, Clock, Data, Deferred, Duration, Effect, Exit, Fiber, Option, Result, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
@@ -28,6 +30,7 @@ import { SessionSchema } from "../schema.js"
 import { toSessionError } from "../to-session-error.js"
 import { SessionUsage } from "../usage.js"
 import { ModelRoute } from "../../model-route.js"
+import { ModelRouteLimits } from "../../model-route-limits.js"
 import { ModelRouteLog } from "../../model-route-log.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
@@ -88,6 +91,26 @@ export const failedAttemptCount = (key?: string) =>
 
 export const clearFailedAttempt = (key: string) => failedAttempts.delete(key)
 
+/**
+ * Reads the rate-limit headers of a request's response as soon as the provider answers, so what a
+ * successful request said about its quota is kept as well as what a failed one did. Each snapshot is
+ * handed to the routing state immediately: a spent window holds the target back for the next turn.
+ */
+export const captureRateLimit = (target: ModelRoute.Target) => {
+  const capture: { snapshot?: ModelRouteLimits.Snapshot } = {}
+  const options = (base: StreamOptions): StreamOptions => ({
+    ...base,
+    onResponse: (http: HttpContext) => {
+      base.onResponse?.(http)
+      const snapshot = ModelRouteLimits.snapshot(RequestExecutor.responseRateLimit(http.headers), Date.now())
+      if (!snapshot) return
+      capture.snapshot = snapshot
+      ModelRoute.observeRateLimit(target, snapshot)
+    },
+  })
+  return { capture, options }
+}
+
 /** Cooldown input from a provider error: a stated retry-after, or an exhausted quota. */
 export const failureHint = (failure: AIError): ModelRoute.FailureHint => {
   const reason = failure.reason as {
@@ -126,8 +149,10 @@ export const make = Effect.gen(function* () {
       readonly stream: Stream.Stream<LLMEvent, AIError>
       readonly startedAt: number
       readonly outputAt?: number
+      readonly rateLimit?: ReturnType<typeof captureRateLimit>
     },
   ) {
+    const rateLimit = raced?.rateLimit ?? captureRateLimit(input.model.ref)
     const startSnapshot = yield* snapshots.capture()
     const requestStarted = raced?.startedAt ?? performance.now()
     const wallStarted = Date.now() - (performance.now() - requestStarted)
@@ -166,7 +191,9 @@ export const make = Effect.gen(function* () {
     let firstOutputAt = raced?.outputAt
     if (firstOutputAt !== undefined) yield* Deferred.succeed(firstOutput, undefined)
     // Read to the end, not just the finish event, so the next request can reuse this response.
-    const providerStream = (raced?.stream ?? llm.stream(input.prepared.request, input.prepared.options)).pipe(
+    const providerStream = (
+      raced?.stream ?? llm.stream(input.prepared.request, rateLimit.options(input.prepared.options))
+    ).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           if (overflowFailure || providerFailure || publisher.hasProviderError()) return
@@ -268,6 +295,25 @@ export const make = Effect.gen(function* () {
             model: input.model.ref,
             message: overflow?.message,
           })
+          ModelRouteLog.record({
+            kind: "attempt",
+            row: {
+              time_started: wallStarted,
+              time_ended: Date.now(),
+              session_id: input.sessionID,
+              assistant_message_id: input.assistantMessageID,
+              route_id: input.model.routing?.routeID ?? "",
+              provider_id: input.model.ref.providerID,
+              model_id: input.model.ref.id,
+              variant: input.model.ref.variant,
+              outcome: "failure",
+              error_tag: "ContextOverflow",
+              error_message: overflow?.message,
+              retryable: false,
+              output_started: false,
+              response_ms: performance.now() - requestStarted,
+            },
+          })
           return Outcome.Compacted()
         }
 
@@ -290,6 +336,56 @@ export const make = Effect.gen(function* () {
               : unknownFinish
         const failureError = llmFailure ? toSessionError(llmFailure) : undefined
         const llmError = failureError && !recorded.providerFailed ? failureError : undefined
+        // Every attempt is logged where its outcome is first known, ahead of every early return, so a
+        // failure that fails over, retries or recovers is recorded like any other. Routed or not, so
+        // provider-wide trouble is visible across models.
+        {
+          const finishedAt = performance.now()
+          const failed = llmFailure !== undefined
+          const timedOut = failed && llmFailure.reason._tag === "Transport" && llmFailure.reason.code === "Timeout"
+          const tokens = recorded.finish?.tokens
+          ModelRoute.recordUsage(input.model.ref, tokens ? tokens.input + tokens.output + tokens.reasoning : 0)
+          const failureLog = failed ? ModelRouteLog.failureFields(llmFailure.reason) : undefined
+          if (failed)
+            ModelRoute.observeRateLimit(
+              input.model.ref,
+              ModelRouteLimits.snapshot(
+                (llmFailure.reason as { rateLimit?: ModelRouteLimits.Details }).rateLimit,
+                Date.now(),
+              ),
+            )
+          ModelRouteLog.record({
+            kind: "attempt",
+            row: {
+              time_started: wallStarted,
+              time_ended: Date.now(),
+              session_id: input.sessionID,
+              assistant_message_id: input.assistantMessageID,
+              route_id: input.model.routing?.routeID ?? "",
+              provider_id: input.model.ref.providerID,
+              model_id: input.model.ref.id,
+              variant: input.model.ref.variant,
+              outcome: streamInterrupted ? "interrupted" : timedOut ? "timeout" : failed ? "failure" : "success",
+              ...failureLog,
+              // A failed request's own details win; a successful one keeps what its response said.
+              quota: failureLog?.quota ?? (rateLimit.capture.snapshot && { ...rateLimit.capture.snapshot }),
+              retryable: failed ? SessionRunnerRetry.isRetryable(llmFailure) : undefined,
+              output_started: recorded.outputStarted,
+              first_token_ms: firstOutputAt === undefined ? undefined : firstOutputAt - requestStarted,
+              response_ms: finishedAt - requestStarted,
+              tokens_per_second:
+                tokens && firstOutputAt !== undefined
+                  ? ((tokens.output + tokens.reasoning) * 1_000) / Math.max(1, finishedAt - firstOutputAt)
+                  : undefined,
+              tokens_input: tokens?.input,
+              tokens_estimated: false,
+              tokens_output: tokens?.output,
+              tokens_reasoning: tokens?.reasoning,
+              tokens_cache_read: tokens?.cache.read,
+              tokens_cache_write: tokens?.cache.write,
+            },
+          })
+        }
         if (
           input.recoverContinuation &&
           llmFailure?.reason._tag === "Transport" &&
@@ -398,43 +494,6 @@ export const make = Effect.gen(function* () {
             tokensPerSecond: ((record.finish.tokens.output + record.finish.tokens.reasoning) * 1_000) / outputDuration,
           })
         }
-        // Every attempt is logged, routed or not, so provider-wide trouble is visible across models.
-        {
-          const finishedAt = performance.now()
-          const failed = llmFailure !== undefined
-          const timedOut = failed && llmFailure.reason._tag === "Transport" && llmFailure.reason.code === "Timeout"
-          const tokens = record.finish?.tokens
-          ModelRoute.recordUsage(input.model.ref, tokens ? tokens.input + tokens.output + tokens.reasoning : 0)
-          ModelRouteLog.record({
-            kind: "attempt",
-            row: {
-              time_started: wallStarted,
-              time_ended: Date.now(),
-              session_id: input.sessionID,
-              assistant_message_id: input.assistantMessageID,
-              route_id: input.model.routing?.routeID ?? "",
-              provider_id: input.model.ref.providerID,
-              model_id: input.model.ref.id,
-              variant: input.model.ref.variant,
-              outcome: streamInterrupted ? "interrupted" : timedOut ? "timeout" : failed ? "failure" : "success",
-              ...(failed ? ModelRouteLog.failureFields(llmFailure.reason) : {}),
-              retryable: failed ? SessionRunnerRetry.isRetryable(llmFailure) : undefined,
-              output_started: record.outputStarted,
-              first_token_ms: firstOutputAt === undefined ? undefined : firstOutputAt - requestStarted,
-              response_ms: finishedAt - requestStarted,
-              tokens_per_second:
-                tokens && firstOutputAt !== undefined
-                  ? ((tokens.output + tokens.reasoning) * 1_000) / Math.max(1, finishedAt - firstOutputAt)
-                  : undefined,
-              tokens_input: tokens?.input,
-              tokens_estimated: false,
-              tokens_output: tokens?.output,
-              tokens_reasoning: tokens?.reasoning,
-              tokens_cache_read: tokens?.cache.read,
-              tokens_cache_write: tokens?.cache.write,
-            },
-          })
-        }
         if (record.finish || record.failure) {
           const snapshot = yield* snapshots.capture()
           const files =
@@ -492,8 +551,9 @@ export const make = Effect.gen(function* () {
     const routing = input.model.routing
     const prepareFor = input.prepareFor
     if (!routing?.hedgeAfterMs || !prepareFor) return yield* run(input)
+    const primaryLimit = captureRateLimit(input.model.ref)
     const raced = yield* SessionHedge.race({
-      primary: llm.stream(input.prepared.request, input.prepared.options),
+      primary: llm.stream(input.prepared.request, primaryLimit.options(input.prepared.options)),
       afterMs: routing.hedgeAfterMs,
       deadlineMs: typeof routing.policy.firstTokenTimeoutMs === "number" ? routing.policy.firstTokenTimeoutMs : 60_000,
       // No next target, or one that cannot be prepared, simply means there is nothing to hedge with.
@@ -502,12 +562,13 @@ export const make = Effect.gen(function* () {
           next === undefined
             ? Effect.succeed(Option.none())
             : prepareFor(next).pipe(
-                Effect.map((prepared) =>
-                  Option.some({
-                    value: { model: next, prepared },
-                    stream: llm.stream(prepared.request, prepared.options),
-                  }),
-                ),
+                Effect.map((prepared) => {
+                  const rateLimit = captureRateLimit(next.ref)
+                  return Option.some({
+                    value: { model: next, prepared, rateLimit },
+                    stream: llm.stream(prepared.request, rateLimit.options(prepared.options)),
+                  })
+                }),
               ),
         ),
         Effect.catch(() => Effect.succeed(Option.none())),
@@ -540,6 +601,7 @@ export const make = Effect.gen(function* () {
     }
     const winner = raced.winner === "hedge" ? raced.value : undefined
     return yield* run(winner ? { ...input, model: winner.model, prepared: winner.prepared } : input, {
+      rateLimit: winner ? winner.rateLimit : primaryLimit,
       stream: raced.stream,
       startedAt: raced.startedAt,
       ...(raced.outputAt !== undefined ? { outputAt: raced.outputAt } : {}),

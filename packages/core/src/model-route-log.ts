@@ -100,6 +100,12 @@ export const onRestoreCooldowns = (next: typeof restoreCooldowns) => {
   restoreCooldowns = next
 }
 
+let restoreLimits: ((rows: readonly CooldownRow[]) => void) | undefined
+
+export const onRestoreLimits = (next: typeof restoreLimits) => {
+  restoreLimits = next
+}
+
 /** Cooldowns still in force, rebuilt from the health history so a restart does not send traffic
  * straight back to a target that was just failing. */
 export const restoreCooldownsFrom = (db: Database.Interface["db"]) =>
@@ -111,20 +117,27 @@ export const restoreCooldownsFrom = (db: Database.Interface["db"]) =>
       .where(
         and(
           gte(RouteHealthTable.time, now - 86_400_000),
-          or(eq(RouteHealthTable.kind, "cooldown-start"), eq(RouteHealthTable.kind, "cooldown-end")),
+          or(
+            eq(RouteHealthTable.kind, "cooldown-start"),
+            eq(RouteHealthTable.kind, "cooldown-end"),
+            eq(RouteHealthTable.kind, "rate-limit-window"),
+          ),
         ),
       )
       .orderBy(asc(RouteHealthTable.time), asc(RouteHealthTable.id))
       .all()
       .pipe(Effect.orElseSucceed(() => []))
     const latest = new Map<string, CooldownRow>()
+    const windows = new Map<string, CooldownRow>()
     for (const row of rows) {
       const id = `${row.provider_id}/${row.model_id}`
-      if (row.kind === "cooldown-end") latest.delete(id)
-      else if (row.until !== null)
-        latest.set(id, { providerID: row.provider_id, modelID: row.model_id, until: row.until })
+      const entry = { providerID: row.provider_id, modelID: row.model_id, until: row.until ?? 0 }
+      if (row.kind === "rate-limit-window") windows.set(id, entry)
+      else if (row.kind === "cooldown-end") latest.delete(id)
+      else if (row.until !== null) latest.set(id, entry)
     }
     restoreCooldowns?.([...latest.values()].filter((row) => row.until > now))
+    restoreLimits?.([...windows.values()].filter((row) => row.until > now))
   })
 
 /** Usage of the last day, so budgets survive a restart. */

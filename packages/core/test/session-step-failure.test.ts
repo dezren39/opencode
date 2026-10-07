@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { AIError, ProviderInternalError, QuotaExceededError, RateLimitError, TransportError } from "@opencode/ai"
+import { ModelRoute } from "@opencode/core/model-route"
 import { SessionStep } from "@opencode/core/session/runner/step"
 
 const error = (reason: ConstructorParameters<typeof AIError>[0]["reason"]) => new AIError({ reason })
@@ -61,5 +62,66 @@ describe("SessionStep failed attempt counter", () => {
     expect(SessionStep.failedAttemptCount()).toBeLessThanOrEqual(SessionStep.FAILED_ATTEMPT_LIMIT)
     expect(SessionStep.failedAttemptCount("bounded|0")).toBe(0)
     expect(SessionStep.failedAttemptCount(`bounded|${SessionStep.FAILED_ATTEMPT_LIMIT + 499}`)).toBe(1)
+  })
+})
+
+describe("SessionStep.captureRateLimit", () => {
+  const target = ModelRoute.ref({ providerID: "openai", model: "captured" })
+  const http = (headers: Record<string, string>) =>
+    ({ url: "https://api.example.com/v1", status: 200, headers }) as never
+
+  test("keeps what a successful response said about OpenAI-style windows and acts on a spent one", () => {
+    ModelRoute.resetHealth()
+    const { capture, options } = SessionStep.captureRateLimit(target)
+    options({}).onResponse?.(
+      http({
+        "x-ratelimit-limit-requests": "60",
+        "x-ratelimit-remaining-requests": "0",
+        "x-ratelimit-reset-requests": "20s",
+        "x-ratelimit-remaining-tokens": "9000",
+        "x-ratelimit-limit-tokens": "10000",
+        "content-type": "text/event-stream",
+      }),
+    )
+    expect(capture.snapshot).toMatchObject({
+      limit: { requests: "60", tokens: "10000" },
+      remaining: { requests: "0", tokens: "9000" },
+      reset: { requests: "20s" },
+    })
+    expect(ModelRoute.limitedUntil(target)).toBeGreaterThan(Date.now() + 15_000)
+  })
+
+  test("reads Anthropic-style windows with timestamp resets", () => {
+    ModelRoute.resetHealth()
+    const { capture, options } = SessionStep.captureRateLimit(target)
+    const reset = new Date(Date.now() + 120_000).toISOString()
+    options({}).onResponse?.(
+      http({
+        "anthropic-ratelimit-requests-limit": "50",
+        "anthropic-ratelimit-requests-remaining": "49",
+        "anthropic-ratelimit-requests-reset": reset,
+        "anthropic-ratelimit-output-tokens-remaining": "0",
+        "anthropic-ratelimit-output-tokens-limit": "8000",
+        "anthropic-ratelimit-output-tokens-reset": reset,
+      }),
+    )
+    expect(capture.snapshot?.remaining).toEqual({ requests: "49", "output-tokens": "0" })
+    expect(ModelRoute.limitedUntil(target)).toBeGreaterThan(Date.now() + 100_000)
+  })
+
+  test("a response without rate-limit headers captures nothing and holds nothing", () => {
+    ModelRoute.resetHealth()
+    const { capture, options } = SessionStep.captureRateLimit(target)
+    options({}).onResponse?.(http({ "content-type": "text/event-stream" }))
+    expect(capture.snapshot).toBeUndefined()
+    expect(ModelRoute.rateLimitOf(target)).toBeUndefined()
+  })
+
+  test("still calls an existing observer", () => {
+    ModelRoute.resetHealth()
+    const seen: number[] = []
+    const { options } = SessionStep.captureRateLimit(target)
+    options({ onResponse: (value) => void seen.push(value.status) }).onResponse?.(http({}))
+    expect(seen).toEqual([200])
   })
 })
