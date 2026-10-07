@@ -147,6 +147,9 @@ export interface Resolved {
     /** Start the next target if this one is silent after this long. */
     readonly hedgeAfterMs?: number
     readonly fallback: () => Effect.Effect<Resolved | undefined, Error>
+    /** Set just after a session failed over: the target it came from, which a hedge races instead of
+     * the next fallback while the session is still new on the alternate. */
+    readonly origin?: () => Effect.Effect<Resolved | undefined, Error>
   }
 }
 
@@ -502,6 +505,22 @@ export const layer = Layer.effect(
             continue
           }
           const current = resolved.success
+          // A session that just moved off its origin races that origin rather than the next fallback.
+          const home = sessionID === undefined ? undefined : ModelRoute.hedgeHome(definition.id, sessionID)
+          const homeIndex =
+            home === undefined ? -1 : definition.targets.findIndex((item) => `${item.providerID}/${item.id}` === home)
+          const origin =
+            homeIndex >= 0 && homeIndex !== index
+              ? () =>
+                  resolveRoute(
+                    selected,
+                    definition,
+                    requestedVariant,
+                    new Set(definition.targets.flatMap((_, position) => (position === homeIndex ? [] : [position]))),
+                    false,
+                    sessionID,
+                  )
+              : undefined
           return {
             ...current,
             // The alias advertises the safest shared request shape. Pricing and provider metadata stay
@@ -514,9 +533,12 @@ export const layer = Layer.effect(
               routeID: definition.id,
               target: current.ref,
               policy: definition.health,
-              attempts: definition.attempts ?? 1,
+              // Two tries by default: a single transient failure on a steady target is retried before the
+              // route moves on. Rate limits skip the retry (see the runner). Set 1 to fail over at once.
+              attempts: definition.attempts ?? 2,
               ...(definition.hedgeAfterMs ? { hedgeAfterMs: definition.hedgeAfterMs } : {}),
               fallback: () => resolveRoute(selected, definition, requestedVariant, triedTargets, false, sessionID),
+              ...(origin ? { origin } : {}),
             },
           }
         }

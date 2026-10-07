@@ -145,6 +145,12 @@ export const failureHint = (failure: AIError): ModelRoute.FailureHint => {
   }
 }
 
+/** A provider that says it is rate limited or out of quota: moving on beats waiting on the same target. */
+const isRateLimited = (failure: AIError) =>
+  failure.reason._tag === "RateLimit" ||
+  failure.reason._tag === "QuotaExceeded" ||
+  failureHint(failure).retryAfterMs !== undefined
+
 const TOOLS_INTERRUPTED = { type: "aborted", message: "Tool execution interrupted" } as const
 const STEP_INTERRUPTED = { type: "aborted", message: "Step interrupted" } as const
 const RESULT_MISSING = { type: "tool.result-missing", message: "Provider did not return a tool result" } as const
@@ -435,6 +441,10 @@ export const make = Effect.gen(function* () {
           routeFailure &&
           !recorded.outputStarted &&
           retry?.retry === true &&
+          // A transient failure on a target with a good record gets another try; a rate limit or a
+          // target that keeps failing moves the turn on immediately.
+          !isRateLimited(llmFailure) &&
+          ModelRoute.steady(input.model.routing.target) &&
           (failedAttempts.get(retryKey) ?? 0) + 1 < input.model.routing.attempts
         if (sameTargetRetry) {
           countFailedAttempt(retryKey)
@@ -450,6 +460,8 @@ export const make = Effect.gen(function* () {
                 to: `${fallback.success.ref.providerID}/${fallback.success.ref.id}`,
                 reason: failureError?.message,
               })
+              if (input.sessionID)
+                ModelRoute.moved(input.model.routing.routeID, input.sessionID, input.model.routing.target)
               return Outcome.Failover({ model: fallback.success, error: failureError })
             }
           }
@@ -508,6 +520,8 @@ export const make = Effect.gen(function* () {
             responseMs: completedAt - requestStarted,
             tokensPerSecond: ((record.finish.tokens.output + record.finish.tokens.reasoning) * 1_000) / outputDuration,
           })
+          if (input.sessionID)
+            ModelRoute.served(input.model.routing.routeID, input.sessionID, input.model.routing.target)
         }
         if (record.finish || record.failure) {
           const snapshot = yield* snapshots.capture()
@@ -574,7 +588,8 @@ export const make = Effect.gen(function* () {
       afterMs: routing.hedgeAfterMs,
       deadlineMs: typeof routing.policy.firstTokenTimeoutMs === "number" ? routing.policy.firstTokenTimeoutMs : 60_000,
       // No next target, or one that cannot be prepared, simply means there is nothing to hedge with.
-      start: Effect.suspend(() => routing.fallback()).pipe(
+      // A session that just moved races its origin, where its cache is, rather than the next fallback.
+      start: Effect.suspend(() => (routing.origin ? routing.origin() : routing.fallback())).pipe(
         Effect.flatMap((next) =>
           next === undefined
             ? Effect.succeed(Option.none())

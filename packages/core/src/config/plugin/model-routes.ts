@@ -77,7 +77,7 @@ export const Plugin = define({
               })),
               health,
               nodes,
-              attempts: route.attempts ?? 1,
+              ...(route.attempts !== undefined ? { attempts: route.attempts } : {}),
               ...(route.hedgeAfterMs ? { hedgeAfterMs: route.hedgeAfterMs } : {}),
               ...(route.autonomy ? { autonomy: route.autonomy } : {}),
               budgets: expanded.map((target) => target.budget ?? {}),
