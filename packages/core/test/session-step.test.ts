@@ -387,6 +387,15 @@ it.live("hedges to the next target when the first stays silent, and the faster a
       model_id: "backup",
       tokens_estimated: false,
     })
+    // The race itself is named before either leg answers.
+    const starts = logged.flatMap((event) =>
+      event.kind === "decision" && event.row.reason === "hedge-started" ? [event.row] : [],
+    )
+    expect(starts).toHaveLength(1)
+    expect(starts[0]).toMatchObject({
+      selection: "hedge-race",
+      candidates: ["openai/primary", "anthropic/backup"],
+    })
   }),
 )
 

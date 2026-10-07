@@ -2,9 +2,10 @@ export * as ModelRouteLog from "./model-route-log.js"
 
 import { and, asc, count, desc, eq, gt, gte, isNull, or, sql } from "drizzle-orm"
 import { Effect, Layer, Queue } from "effect"
-import type { HttpContext } from "@opencode/ai"
+import type { AIError, HttpContext } from "@opencode/ai"
 import { RequestExecutor, type StreamOptions } from "@opencode/ai/route"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
+import { snapshot as takeSnapshot, type Snapshot } from "./model-route-limits.js"
 import { Database } from "./database/database.js"
 import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable, RouteNoteTable } from "./model-route-log/sql.js"
 
@@ -156,6 +157,16 @@ export const observeRateLimits = (onRateLimit: (snapshot: RateLimitSnapshot) => 
         snapshot = value
         onRateLimit(value)
       },
+      // A rejection's own headers are worth as much as a success's: a mid-stream 429 should move
+      // traffic just like a slow success does.
+      onRejected: (error: AIError) => {
+        base.onRejected?.(error)
+        const reason = (error as { reason?: { rateLimit?: RateLimitSnapshot } }).reason
+        const value = rateLimitSnapshot(reason?.rateLimit, Date.now())
+        if (!value) return
+        snapshot = value
+        onRateLimit(value)
+      },
     }),
   }
 }
@@ -290,7 +301,7 @@ export const restoreCooldownsFrom = (db: Database.Interface["db"]) =>
       .all()
       .pipe(Effect.orElseSucceed(() => []))
     const latest = new Map<string, CooldownRow>()
-    const windows = new Map<string, CooldownRow>()
+    const windows = new Map<string, CooldownRow & { snapshot?: Snapshot }>()
     for (const row of rows) {
       const id = `${row.provider_id}/${row.model_id}`
       const entry = { providerID: row.provider_id, modelID: row.model_id, until: row.until ?? 0 }
@@ -298,8 +309,48 @@ export const restoreCooldownsFrom = (db: Database.Interface["db"]) =>
       else if (row.kind === "cooldown-end") latest.delete(id)
       else if (row.until !== null) latest.set(id, entry)
     }
+    // Cold targets get the provider's last word back too: the newest stored attempt snapshot.
+    const snapshots = yield* db
+      .select({
+        providerID: RouteAttemptTable.provider_id,
+        modelID: RouteAttemptTable.model_id,
+        quota: RouteAttemptTable.quota,
+        time: RouteAttemptTable.time_ended,
+      })
+      .from(RouteAttemptTable)
+      .where(
+        and(
+          gte(RouteAttemptTable.time_ended, now - 86_400_000),
+          sql`${RouteAttemptTable.quota} is not null`,
+        ),
+      )
+      .orderBy(asc(RouteAttemptTable.time_ended))
+      .all()
+      .pipe(Effect.orElseSucceed(() => []))
+    for (const row of snapshots) {
+      const id = `${row.providerID}/${row.modelID}`
+      const stored = (row.quota ?? {}) as Partial<Snapshot>
+      const parsed =
+        typeof stored !== "object" || stored === null
+          ? undefined
+          : takeSnapshot(
+              {
+                limit: stored.limit,
+                remaining: stored.remaining,
+                reset: stored.reset,
+                retryAfterMs: stored.retryAfterMs,
+              },
+              row.time,
+            )
+      const current = windows.get(id)
+      if (!parsed) continue
+      if (current) windows.set(id, { ...current, snapshot: parsed })
+      else windows.set(id, { providerID: row.providerID, modelID: row.modelID, until: 0, snapshot: parsed })
+    }
     restoreCooldowns?.([...latest.values()].filter((row) => row.until > now))
-    restoreLimits?.([...windows.values()].filter((row) => row.until > now))
+    restoreLimits?.(
+      [...windows.values()].filter((row) => row.until > now || row.snapshot !== undefined),
+    )
   })
 
 /** Usage of the last day, so budgets survive a restart. */

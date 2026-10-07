@@ -187,6 +187,10 @@ export interface StreamOptions {
    * metadata (status and headers). Lets callers read rate-limit details of a successful request.
    * Not called for transports with no HTTP response. */
   readonly onResponse?: (http: HttpContext) => void
+  /** Mirror of `onResponse` for requests the provider rejected: called with the failure before it
+   * propagates, so callers can read its HTTP status, headers and rate-limit details. A throwing
+   * observer never breaks the request it observes. */
+  readonly onRejected?: (error: AIError) => void
 }
 
 export interface StreamMethod {
@@ -610,11 +614,22 @@ export const compileRequest = Effect.fn("LLM.compileRequest")(function* (request
   }
 })
 
+const notifyRejection = (options: StreamOptions | undefined) => (error: AIError) =>
+  Effect.sync(() => {
+    try {
+      options?.onRejected?.(error)
+    } catch {
+      // A caller's observer must never break the request it observes.
+    }
+  })
+
 const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest, options?: StreamOptions) =>
   Stream.unwrap(
     Effect.gen(function* () {
       const compiled = yield* compile(request, options)
-      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime, options)
+      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime, options).pipe(
+        Stream.tapError(notifyRejection(options)),
+      )
     }),
   )
 

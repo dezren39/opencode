@@ -375,6 +375,41 @@ describe("rate-limit window restore", () => {
   )
 })
 
+describe("cold-target rate-limit restore", () => {
+  it.live("brings back the provider's last word, not just the hold", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      ModelRoute.resetHealth()
+      const now = Date.now()
+      // A successful attempt whose response advertised a nearly-spent window.
+      ModelRouteLog.record({
+        kind: "attempt",
+        row: {
+          time_started: now - 60_000,
+          time_ended: now - 59_000,
+          route_id: "r",
+          provider_id: "cold",
+          model_id: "m",
+          outcome: "success",
+          output_started: true,
+          quota: {
+            at: now - 60_000,
+            limit: { requests: "60" },
+            remaining: { requests: "2" },
+            reset: { requests: "10m" },
+          },
+        },
+      })
+      yield* Effect.sleep("100 millis")
+
+      yield* ModelRouteLog.restoreCooldownsFrom(db)
+      const target = ModelRoute.ref({ providerID: "cold", model: "m" })
+      // The snapshot itself is back, so route_stats can show it before first use.
+      expect(ModelRoute.rateLimitOf(target)?.remaining).toEqual({ requests: "2" })
+    }),
+  )
+})
+
 describe("ModelRouteLog.observer", () => {
   it.live("records every call's attempt, so background generation is not invisible", () =>
     Effect.gen(function* () {
