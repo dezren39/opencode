@@ -114,14 +114,19 @@ export const ref = (target: { providerID: string; model: string; variant?: strin
     ...(target.variant ? { variant: Model.VariantID.make(target.variant) } : {}),
   })
 
-const health = new Map<string, { samples: boolean[]; cooldownUntil: number }>()
+const health = new Map<string, { samples: boolean[]; outcomes: boolean[]; cooldownUntil: number }>()
 const HEALTH_LIMIT = 2_000
+// Recent finished requests per target (true = answered). A target with at most one give-up in this
+// window is steady: a single failure there is treated as transient before the route moves on.
+const OUTCOME_WINDOW = 5
 
 const key = (target: Model.Ref) => `${target.providerID}/${target.id}`
 
+const pushOutcome = (outcomes: boolean[], answered: boolean) => [...outcomes, answered].slice(-OUTCOME_WINDOW)
+
 const entry = (target: Model.Ref) => {
   const id = key(target)
-  const current = health.get(id) ?? { samples: [], cooldownUntil: 0 }
+  const current = health.get(id) ?? { samples: [], outcomes: [], cooldownUntil: 0 }
   health.delete(id)
   health.set(id, current)
   while (health.size > HEALTH_LIMIT) health.delete(health.keys().next().value!)
@@ -212,6 +217,7 @@ export const failed = (target: Model.Ref, policy: Policy, now = Date.now(), hint
   }
   const state = entry(target)
   state.samples = []
+  state.outcomes = pushOutcome(state.outcomes, false)
   const cooldown =
     hint?.retryAfterMs !== undefined && hint.retryAfterMs > 0
       ? Math.min(Math.max(hint.retryAfterMs, 1_000), MAX_COOLDOWN_MS)
@@ -242,6 +248,12 @@ export const slow = (target: Model.Ref, policy: Policy, now = Date.now()) => {
   }
 }
 
+/** A target is steady while it has at most one give-up among its recent requests. */
+export const steady = (target: Model.Ref) => {
+  const state = health.get(key(target))
+  return (state?.outcomes ?? []).filter((answered) => !answered).length <= 1
+}
+
 export const completed = (
   target: Model.Ref,
   policy: Policy,
@@ -249,6 +261,7 @@ export const completed = (
   now = Date.now(),
 ) => {
   const state = entry(target)
+  state.outcomes = pushOutcome(state.outcomes, true)
   recover(target, state, now)
   if (state.cooldownUntil > now) return
   const slow =
@@ -270,6 +283,7 @@ export const resetHealth = () => {
   usage.clear()
   adjustments = []
   health.clear()
+  continuity.clear()
   recentFailures.length = 0
 }
 
@@ -630,9 +644,22 @@ export const nextTarget = (
     )
     const selectionKey = `${node.routeID ?? definition.id}#${nodeIndex}`
     const priorSticky = sessionID ? sessionTarget(selectionKey, sessionID) : undefined
+    // A session stays on the target it is being answered by while that target is ready, so a recovered
+    // primary does not pull it back and throw away the cache it has built on the fallback.
+    const current = sessionID ? continuityOf(definition.id, sessionID)?.current : undefined
+    const currentPosition =
+      current === undefined
+        ? undefined
+        : positions.find((position) => {
+            const leaf = node.children[position].leaf
+            return leaf !== undefined && key(definition.targets[leaf]) === current
+          })
     let ordered = positions
     let decisionReason = "ordered"
-    if (node.selection === "ordered" && positions.some((position) => factors[position] !== 1)) {
+    if (node.selection === "ordered" && currentPosition !== undefined) {
+      ordered = [currentPosition, ...positions.filter((position) => position !== currentPosition)]
+      decisionReason = "sticky"
+    } else if (node.selection === "ordered" && positions.some((position) => factors[position] !== 1)) {
       ordered = positions.toSorted((left, right) => factors[right] - factors[left])
       decisionReason = "adjusted"
     } else if (sessionID && sessionScoped(node.selection)) {
@@ -712,3 +739,51 @@ export const forgetSession = (routeID: string, sessionID: string) => {
 }
 
 export const resetSelection = () => selection.clear()
+
+/** Where a session has been answered on a route. `origin` is the target it moved away from after a
+ * failover; `away` counts requests answered since on the target it moved to. */
+export interface Continuity {
+  readonly current: string
+  readonly origin?: string
+  readonly away: number
+}
+
+/** A session that just failed over may hedge back to its origin for this many requests. */
+export const ORIGIN_HEDGE_REQUESTS = 2
+const CONTINUITY_LIMIT = 5_000
+const continuity = new Map<string, Continuity>()
+
+const continuityKey = (routeID: string, sessionID: string) => `${routeID}\u0000${sessionID}`
+
+export const continuityOf = (routeID: string, sessionID: string) => continuity.get(continuityKey(routeID, sessionID))
+
+const remember = (id: string, next: Continuity) => {
+  continuity.delete(id)
+  continuity.set(id, next)
+  while (continuity.size > CONTINUITY_LIMIT) continuity.delete(continuity.keys().next().value!)
+}
+
+/** A request on this route failed over from `from`. The first move keeps `from` as the origin; later
+ * moves keep the original origin, so a session drifting between fallbacks still returns home. */
+export const moved = (routeID: string, sessionID: string, from: Model.Ref) => {
+  const id = continuityKey(routeID, sessionID)
+  const prior = continuity.get(id)
+  remember(id, { current: key(from), origin: prior?.origin ?? key(from), away: 0 })
+}
+
+/** A request on this route was answered by `target`. Answering from the origin ends the move. */
+export const served = (routeID: string, sessionID: string, target: Model.Ref) => {
+  const id = continuityKey(routeID, sessionID)
+  const current = key(target)
+  const prior = continuity.get(id)
+  if (prior?.origin === undefined || prior.origin === current) return remember(id, { current, away: 0 })
+  remember(id, { current, origin: prior.origin, away: Math.min(prior.away + 1, ORIGIN_HEDGE_REQUESTS) })
+}
+
+/** The origin a session should hedge back to: only just after it moved, and never once it has
+ * settled on the new target. */
+export const hedgeHome = (routeID: string, sessionID: string) => {
+  const state = continuityOf(routeID, sessionID)
+  if (state?.origin === undefined || state.away >= ORIGIN_HEDGE_REQUESTS) return undefined
+  return state.origin
+}

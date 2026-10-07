@@ -299,9 +299,21 @@ levels existed. The scheduled review runs when `model_route_tuning.enabled` is t
 or any route is `adaptive` or higher. Real failures always cool a target down, at
 every level, so a `fixed` route still fails over.
 
-Set `attempts` (default 1) to retry a target that many times before the route
-moves on. Retries only happen before any output, so a tool call never runs
-twice. A target that fails is not penalized until its attempts are used up.
+Set `attempts` to retry a target that many times before the route moves on. The
+default is 2, so one transient failure is retried on the same target before the
+route moves on; set 1 to fail over at once. Retries only happen before any output,
+so a tool call never runs twice. A rate limit or quota error never retries the same
+target: the turn moves on at once. A target that fails is not penalized until its
+attempts are used up, and a target with two give-ups among its last five requests
+is no longer retried, so a struggling target is not given extra chances.
+
+Sessions keep their cache. On an `ordered` route, a session stays on the target
+that last answered it while that target is ready, so a recovered primary does not
+pull it back mid-conversation. When a session has just failed over, the first two
+requests on the new target are hedged against the target it came from, if
+`hedgeAfterMs` is set; the origin is raced only while it is ready, and a session
+that settles on the new target stops hedging back. These rules are on by default
+and need no configuration.
 
 Set `hedgeAfterMs` to guard against a target that is slow rather than down. If the
 current target has produced no output after that long, the same request is sent to

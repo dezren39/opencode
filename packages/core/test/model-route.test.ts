@@ -383,3 +383,64 @@ describe("ModelRoute provider rate limits", () => {
     expect(ModelRoute.limitedUntil(t, now)).toBe(now + 60_000)
   })
 })
+
+describe("ModelRoute continuity", () => {
+  const primary = ModelRoute.ref({ providerID: "p", model: "a" })
+  const fallback = ModelRoute.ref({ providerID: "p", model: "b" })
+  const policy = ModelRoute.policy()
+  const sample = { firstTokenMs: 100, responseMs: 500, tokensPerSecond: 30 }
+  const ordered = {
+    id: "r",
+    targets: [primary, fallback],
+    targetVariants: [],
+    health: policy,
+    nodes: [{ selection: "ordered" as const, weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] }],
+  } as unknown as ModelRoute.Definition
+  const both = new Set([0, 1])
+
+  test("a target is steady until it has two give-ups in its last five requests", () => {
+    expect(ModelRoute.steady(primary)).toBe(true)
+    ModelRoute.failed(primary, policy)
+    expect(ModelRoute.steady(primary)).toBe(true)
+    ModelRoute.failed(primary, policy)
+    expect(ModelRoute.steady(primary)).toBe(false)
+    for (let index = 0; index < 4; index++) ModelRoute.completed(primary, policy, sample)
+    expect(ModelRoute.steady(primary)).toBe(true)
+  })
+
+  test("a failover keeps the origin and offers it as the hedge partner for the next two requests", () => {
+    ModelRoute.moved("r", "s1", primary)
+    expect(ModelRoute.hedgeHome("r", "s1")).toBe("p/a")
+    ModelRoute.served("r", "s1", fallback)
+    expect(ModelRoute.hedgeHome("r", "s1")).toBe("p/a")
+    ModelRoute.served("r", "s1", fallback)
+    expect(ModelRoute.hedgeHome("r", "s1")).toBeUndefined()
+    expect(ModelRoute.continuityOf("r", "s1")).toMatchObject({ current: "p/b", origin: "p/a", away: 2 })
+  })
+
+  test("answering from the origin again ends the move", () => {
+    ModelRoute.moved("r", "s2", primary)
+    ModelRoute.served("r", "s2", fallback)
+    ModelRoute.served("r", "s2", primary)
+    expect(ModelRoute.continuityOf("r", "s2")).toEqual({ current: "p/a", away: 0 })
+    expect(ModelRoute.hedgeHome("r", "s2")).toBeUndefined()
+  })
+
+  test("an ordered route keeps a session on the target answering it while that target is ready", () => {
+    expect(ModelRoute.orderTargets(ordered, both, "s3", false)).toEqual([0, 1])
+    ModelRoute.moved("r", "s3", primary)
+    ModelRoute.served("r", "s3", fallback)
+    // The primary has recovered and is first in order, but the session stays on the fallback.
+    expect(ModelRoute.orderTargets(ordered, both, "s3", false)).toEqual([1, 0])
+    // Other sessions still start at the primary.
+    expect(ModelRoute.orderTargets(ordered, both, "other", false)).toEqual([0, 1])
+    // If the current target is not ready, the order falls back to the configured one.
+    expect(ModelRoute.orderTargets(ordered, new Set([0]), "s3", false)).toEqual([0])
+  })
+
+  test("a session's continuity is dropped with the rest of the health state", () => {
+    ModelRoute.moved("r", "s4", primary)
+    ModelRoute.resetHealth()
+    expect(ModelRoute.continuityOf("r", "s4")).toBeUndefined()
+  })
+})
