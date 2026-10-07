@@ -439,63 +439,35 @@ export const layer = Layer.effect(
     ): Effect.Effect<Resolved | undefined, Error> =>
       Effect.gen(function* () {
         const now = Date.now()
-        const indexes = definition.targets.flatMap((_, index) => (tried.has(index) ? [] : [index]))
-        const ready = indexes.filter(
-          (index) =>
-            !ModelRoute.coolingDown(definition.targets[index], now) &&
-            !ModelRoute.skipped(definition.targets[index], now) &&
-            !ModelRoute.overBudget(definition.targets[index], definition.budgets?.[index], now),
-        )
-        // When everything is cooling, fall back to the soonest-recovering target rather than failing.
-        const candidates =
-          allowCooling && ready.length === 0
-            ? indexes.toSorted(
-                (left, right) =>
-                  ModelRoute.cooldownUntil(definition.targets[left], now) -
-                  ModelRoute.cooldownUntil(definition.targets[right], now),
-              )
-            : ModelRoute.orderTargets(definition, new Set(ready), sessionID, allowCooling && tried.size === 0)
-
-        if (tried.size === 0 && allowCooling) {
-          const root = definition.nodes[0]
-          const stickyBefore = sessionID ? ModelRoute.sessionTarget(`${definition.id}#0`, sessionID) : undefined
-          ModelRouteLog.record({
-            kind: "decision",
-            row: {
-              time: now,
-              session_id: sessionID,
-              route_id: definition.id,
-              selection: root?.selection ?? "ordered",
-              variant: requestedVariant,
-              candidates: candidates.map(
-                (index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`,
-              ),
-              chosen:
-                candidates[0] === undefined
-                  ? undefined
-                  : `${definition.targets[candidates[0]].providerID}/${definition.targets[candidates[0]].id}`,
-              reason:
-                ready.length === 0
-                  ? "all-cooling"
-                  : !sessionID || !root || root.selection === "ordered"
-                    ? "ordered"
-                    : stickyBefore !== undefined
-                      ? "sticky"
-                      : "drawn",
-              detail: {
-                cooling: indexes
-                  .filter((index) => !ready.includes(index))
-                  .map((index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`),
-                overBudget: indexes
-                  .filter((index) => ModelRoute.overBudget(definition.targets[index], definition.budgets?.[index], now))
-                  .map((index) => `${definition.targets[index].providerID}/${definition.targets[index].id}`),
-              },
-            },
-          })
-        }
-
+        const triedTargets = new Set(tried)
         let lastError: Error | undefined
-        for (const index of candidates) {
+        while (triedTargets.size < definition.targets.length) {
+          const indexes = definition.targets.flatMap((_, index) => (triedTargets.has(index) ? [] : [index]))
+          const unavailable = new Map<number, string>()
+          const ready = indexes.filter((index) => {
+            const target = definition.targets[index]
+            const until = ModelRoute.cooldownUntil(target, now)
+            const isSkipped = ModelRoute.skipped(target, now)
+            const isOverBudget = ModelRoute.overBudget(target, definition.budgets?.[index], now)
+            if (until > now) unavailable.set(index, `cooldown-until:${until}`)
+            else if (isSkipped) unavailable.set(index, "user-skip")
+            else if (isOverBudget) unavailable.set(index, "soft-budget")
+            return until <= now && !isSkipped && !isOverBudget
+          })
+          // Budgets and skips are soft limits: if every remaining target is excluded, try the
+          // configured tree as a last resort rather than refusing a turn.
+          const eligible = ready.length > 0 ? ready : allowCooling ? indexes : []
+          const index = ModelRoute.nextTarget(
+            definition,
+            new Set(eligible),
+            triedTargets,
+            sessionID,
+            sessionID !== undefined,
+            requestedVariant,
+            unavailable,
+          )
+          if (index === undefined) break
+          triedTargets.add(index)
           const target = definition.targets[index]
           const source = yield* models.get(target.providerID, target.id)
           if (!source?.enabled) continue
@@ -523,8 +495,7 @@ export const layer = Layer.effect(
               policy: definition.health,
               attempts: definition.attempts ?? 1,
               ...(definition.hedgeAfterMs ? { hedgeAfterMs: definition.hedgeAfterMs } : {}),
-              fallback: () =>
-                resolveRoute(selected, definition, requestedVariant, new Set([...tried, index]), false, sessionID),
+              fallback: () => resolveRoute(selected, definition, requestedVariant, triedTargets, false, sessionID),
             },
           }
         }

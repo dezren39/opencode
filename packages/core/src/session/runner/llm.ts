@@ -254,6 +254,7 @@ const layer = Layer.effect(
           agent: loaded.agent.id,
           model: loaded.model,
           prepared,
+          estimatedInputTokens: SessionCompaction.estimateContext(loaded),
           prepareFor,
           retry: (cause, error, proposed) =>
             retry.decide({

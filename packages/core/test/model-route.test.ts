@@ -142,17 +142,57 @@ describe("ModelRoute.orderTargets", () => {
   })
 
   test("is sticky per session at every level and drops cooled groups", () => {
-    const first = ModelRoute.orderTargets(definition, all, "s2", true)
-    expect(ModelRoute.orderTargets(definition, all, "s2", true)).toEqual(first)
-    const withoutA = ModelRoute.orderTargets(definition, new Set([2, 3]), "s2", true)
-    expect(withoutA.filter((index) => index < 2)).toEqual([])
-    expect(withoutA).toHaveLength(2)
+    ModelRoute.resetSelection()
+    const first = ModelRoute.nextTarget(definition, all, new Set(), "s2", true, undefined, undefined, () => 0)
+    expect(first).toBe(0)
+    expect(ModelRoute.nextTarget(definition, all, new Set(), "s2", true, undefined, undefined, () => 0.99)).toBe(0)
+    const withoutA = ModelRoute.nextTarget(
+      definition,
+      new Set([2, 3]),
+      new Set(),
+      "s2",
+      true,
+      undefined,
+      undefined,
+      () => 0,
+    )
+    expect(withoutA === 2 || withoutA === 3).toBe(true)
   })
 
   test("round-robin inside a group rotates across sessions", () => {
     const onlyA = new Set([0, 1])
     const heads = ["a", "b", "c", "d"].map((id) => ModelRoute.orderTargets(definition, onlyA, id, true)[0])
     expect(new Set(heads).size).toBe(2)
+  })
+
+  test("does not consume a nested round-robin draw until the parent reaches that group", () => {
+    ModelRoute.resetSelection()
+    const hierarchy = {
+      ...definition,
+      nodes: [
+        {
+          routeID: "outer",
+          selection: "weighted" as const,
+          weights: [99, 1],
+          children: [{ node: 1 }, { leaf: 2 }],
+        },
+        {
+          routeID: "luna",
+          selection: "round-robin" as const,
+          weights: [1, 1],
+          children: [{ leaf: 0 }, { leaf: 1 }],
+        },
+      ],
+    } as unknown as ModelRoute.Definition
+    const ready = new Set([0, 1, 2])
+    // Choose the sibling leaf; the nested route must not spend a turn just because it was inspected.
+    expect(ModelRoute.nextTarget(hierarchy, ready, new Set(), "sibling", true, undefined, undefined, () => 0.999)).toBe(
+      2,
+    )
+    expect(ModelRoute.sessionTarget("luna#1", "sibling")).toBeUndefined()
+    // Subsequent sessions that actually enter Luna should get its RR sequence in order.
+    expect(ModelRoute.nextTarget(hierarchy, ready, new Set(), "luna-a", true, undefined, undefined, () => 0)).toBe(0)
+    expect(ModelRoute.nextTarget(hierarchy, ready, new Set(), "luna-b", true, undefined, undefined, () => 0)).toBe(1)
   })
 })
 
@@ -172,13 +212,24 @@ describe("ModelRoute correlation and adjustments", () => {
 
   test("does not punish targets when unrelated providers fail together", () => {
     ModelRoute.resetHealth()
-    ModelRoute.failed(model("openai", "a"), policy, 1_000)
-    ModelRoute.failed(model("azure", "a"), policy, 2_000)
+    ModelRoute.failed(model("openai", "a"), policy, 1_000, { network: true })
+    ModelRoute.failed(model("azure", "a"), policy, 2_000, { network: true })
     expect(ModelRoute.networkSuspect(2_000)).toBe(false)
-    ModelRoute.failed(model("anthropic", "a"), policy, 3_000)
+    ModelRoute.failed(model("anthropic", "a"), policy, 3_000, { network: true })
     expect(ModelRoute.networkSuspect(3_000)).toBe(true)
     expect(ModelRoute.coolingDown(model("anthropic", "a"), 3_000)).toBe(false)
+    expect(ModelRoute.coolingDown(model("openai", "a"), 3_000)).toBe(false)
+    expect(ModelRoute.coolingDown(model("azure", "a"), 3_000)).toBe(false)
     expect(ModelRoute.networkSuspect(40_000)).toBe(false)
+  })
+
+  test("does not classify provider quota failures as a network outage", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.failed(model("openai", "a"), policy, 1_000, { quota: true })
+    ModelRoute.failed(model("azure", "a"), policy, 2_000, { quota: true })
+    ModelRoute.failed(model("anthropic", "a"), policy, 3_000, { quota: true })
+    expect(ModelRoute.networkSuspect(3_000)).toBe(false)
+    expect(ModelRoute.coolingDown(model("anthropic", "a"), 3_000)).toBe(true)
   })
 
   test("skip and weight adjustments expire and reorder ordered groups", () => {

@@ -53,6 +53,8 @@ interface Input {
   readonly assistantMessageID: SessionMessage.ID
   readonly agent: Agent.ID
   readonly model: SessionRunnerModel.Resolved
+  /** Prompt-size estimate for budget accounting when a hedge is cancelled before provider usage arrives. */
+  readonly estimatedInputTokens?: number
   readonly prepared: Omit<SessionModelRequest.Prepared, "event">
   readonly retry: (
     cause: AIError,
@@ -88,10 +90,21 @@ export const clearFailedAttempt = (key: string) => failedAttempts.delete(key)
 
 /** Cooldown input from a provider error: a stated retry-after, or an exhausted quota. */
 export const failureHint = (failure: AIError): ModelRoute.FailureHint => {
-  const reason = failure.reason as { _tag: string; retryAfterMs?: number; rateLimit?: { retryAfterMs?: number } }
+  const reason = failure.reason as {
+    _tag: string
+    retryAfterMs?: number
+    rateLimit?: { retryAfterMs?: number }
+    http?: unknown
+    code?: string
+    message?: string
+  }
   return {
     retryAfterMs: reason.retryAfterMs ?? reason.rateLimit?.retryAfterMs,
     quota: reason._tag === "QuotaExceeded",
+    network:
+      reason._tag === "Transport" &&
+      reason.http === undefined &&
+      !(reason.code === "Timeout" && reason.message?.startsWith("No response output within ")),
   }
 }
 
@@ -114,7 +127,11 @@ export const make = Effect.gen(function* () {
   const run = Effect.fn("SessionStep.run")(function* (
     input: Input,
     /** Events already being produced for this attempt, from a hedge race. */
-    raced?: { readonly stream: Stream.Stream<LLMEvent, AIError>; readonly startedAt: number },
+    raced?: {
+      readonly stream: Stream.Stream<LLMEvent, AIError>
+      readonly startedAt: number
+      readonly outputAt?: number
+    },
   ) {
     // The start snapshot only has to exist before local tools run, which cannot happen before Step.Started,
     // so it is captured while the provider request is in flight instead of delaying it.
@@ -153,7 +170,8 @@ export const make = Effect.gen(function* () {
     // A local execution starts only after its Tool.Called publication completes.
     let overflowFailure: ProviderErrorEvent | undefined
     let providerFailure: ProviderErrorEvent | undefined
-    let firstOutputAt: number | undefined
+    let firstOutputAt = raced?.outputAt
+    if (firstOutputAt !== undefined) yield* Deferred.succeed(firstOutput, undefined)
     // Read to the end, not just the finish event, so the next request can reuse this response.
     const providerStream = (raced?.stream ?? llm.stream(input.prepared.request, input.prepared.options)).pipe(
       Stream.runForEach((event) =>
@@ -206,7 +224,7 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const firstTokenTimeout = input.model.routing?.policy.firstTokenTimeoutMs
         let stream: Exit.Exit<void, AIError>
-        if (typeof firstTokenTimeout !== "number") {
+        if (typeof firstTokenTimeout !== "number" || raced?.outputAt !== undefined) {
           // Keep the established execution and interruption path unchanged for ordinary models
           // and routes that explicitly disable the first-output deadline.
           stream = yield* restore(providerStream).pipe(Effect.exit)
@@ -217,7 +235,9 @@ export const make = Effect.gen(function* () {
               Deferred.await(firstOutput).pipe(Effect.as(false)),
               Effect.raceFirst(
                 Fiber.await(streamFiber).pipe(Effect.as(false)),
-                Effect.sleep(Duration.millis(firstTokenTimeout)).pipe(Effect.as(true)),
+                Effect.sleep(
+                  Duration.millis(Math.max(0, firstTokenTimeout - (performance.now() - requestStarted))),
+                ).pipe(Effect.as(true)),
               ),
             ),
           )
@@ -420,6 +440,7 @@ export const make = Effect.gen(function* () {
                   ? ((tokens.output + tokens.reasoning) * 1_000) / Math.max(1, finishedAt - firstOutputAt)
                   : undefined,
               tokens_input: tokens?.input,
+              tokens_estimated: false,
               tokens_output: tokens?.output,
               tokens_reasoning: tokens?.reasoning,
               tokens_cache_read: tokens?.cache.read,
@@ -509,11 +530,14 @@ export const make = Effect.gen(function* () {
     if (raced.hedgeStarted) {
       // The target that lost: the primary when the hedge answered first, otherwise the hedge.
       const loser = raced.winner === "hedge" ? input.model : raced.hedgeValue?.model
-      if (raced.winner === "hedge") ModelRoute.slow(input.model.ref, routing.policy)
+      if (loser) {
+        ModelRoute.slow(loser.ref, routing.policy)
+        ModelRoute.recordUsage(loser.ref, input.estimatedInputTokens ?? 0)
+      }
       ModelRouteLog.record({
         kind: "attempt",
         row: {
-          time_started: Date.now() - raced.primaryElapsedMs,
+          time_started: Date.now() - raced.loserElapsedMs,
           time_ended: Date.now(),
           session_id: input.sessionID,
           assistant_message_id: input.assistantMessageID,
@@ -522,7 +546,9 @@ export const make = Effect.gen(function* () {
           model_id: loser?.ref.id ?? input.model.ref.id,
           outcome: "hedged-out",
           output_started: false,
-          response_ms: raced.primaryElapsedMs,
+          response_ms: raced.loserElapsedMs,
+          tokens_input: input.estimatedInputTokens,
+          tokens_estimated: true,
         },
       })
     }
@@ -530,6 +556,7 @@ export const make = Effect.gen(function* () {
     return yield* run(winner ? { ...input, model: winner.model, prepared: winner.prepared } : input, {
       stream: raced.stream,
       startedAt: raced.startedAt,
+      ...(raced.outputAt !== undefined ? { outputAt: raced.outputAt } : {}),
     })
   }, Effect.scoped)
 

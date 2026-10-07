@@ -9,26 +9,40 @@ describe("SessionStep.failureHint", () => {
     expect(SessionStep.failureHint(error(new RateLimitError({ message: "slow down", retryAfterMs: 7_000 })))).toEqual({
       retryAfterMs: 7_000,
       quota: false,
+      network: false,
     })
     expect(
       SessionStep.failureHint(error(new RateLimitError({ message: "slow down", rateLimit: { retryAfterMs: 9_000 } }))),
-    ).toMatchObject({ retryAfterMs: 9_000, quota: false })
+    ).toMatchObject({ retryAfterMs: 9_000, quota: false, network: false })
   })
 
   test("flags an exhausted quota, which carries no retry-after", () => {
     expect(SessionStep.failureHint(error(new QuotaExceededError({ message: "out of quota" })))).toEqual({
       retryAfterMs: undefined,
       quota: true,
+      network: false,
     })
   })
 
   test("an ordinary provider failure may carry a retry-after and is never a quota", () => {
     expect(
       SessionStep.failureHint(error(new ProviderInternalError({ message: "overloaded", retryAfterMs: 3_000 }))),
-    ).toEqual({ retryAfterMs: 3_000, quota: false })
+    ).toEqual({ retryAfterMs: 3_000, quota: false, network: false })
     expect(
       SessionStep.failureHint(error(new TransportError({ message: "reset", transport: "http", operation: "read" }))),
-    ).toEqual({ retryAfterMs: undefined, quota: false })
+    ).toEqual({ retryAfterMs: undefined, quota: false, network: true })
+    expect(
+      SessionStep.failureHint(
+        error(
+          new TransportError({
+            message: "No response output within 1000ms",
+            transport: "http",
+            operation: "request",
+            code: "Timeout",
+          }),
+        ),
+      ),
+    ).toEqual({ retryAfterMs: undefined, quota: false, network: false })
   })
 })
 
