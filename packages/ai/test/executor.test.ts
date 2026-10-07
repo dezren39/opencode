@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Deferred, Effect, Fiber, Layer, Ref, Stream } from "effect"
 import { Headers, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { Socket } from "effect/unstable/socket"
 import { LLM, AIError, HttpContext, InvalidProviderOutputError, TransportError, isRetryable } from "../src/index.js"
 import {
   LLMClient,
@@ -729,8 +730,63 @@ describe("WebSocket channel execution", () => {
     }),
   )
 
-  it.effect("preserves opening event errors and native send exceptions", () =>
+  it.effect("surfaces handshake rate-limit headers when the socket publishes an upgrade event", () =>
     Effect.gen(function* () {
+      // `ws`-style sockets emit `upgrade` with the response; the transport keeps
+      // those headers so a WebSocket request can advertise its rate limits the
+      // way an HTTP response does.
+      let onUpgrade: ((response: { headers?: Record<string, string> }) => void) | undefined
+      class UpgradeSocket extends EventTarget {
+        readyState = globalThis.WebSocket.OPEN
+        send() {}
+        close() {}
+        on(event: string, listener: (response: { headers?: Record<string, string> }) => void) {
+          if (event === "upgrade") onUpgrade = listener
+        }
+      }
+      const socket = new UpgradeSocket()
+      const connection = yield* WebSocketTransport.open({
+        url: "wss://provider.test/responses",
+        headers: Headers.empty,
+      }).pipe(
+        // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the socket stands in for the platform constructor's result.
+        Effect.provideService(Socket.WebSocketConstructor, (() => socket) as never),
+      )
+      expect(connection.http).toBeUndefined()
+      onUpgrade?.({
+        headers: { "X-RateLimit-Remaining-Requests": "7", "Retry-After": "2", Upgrade: "websocket" },
+      })
+      expect(connection.http).toMatchObject({
+        url: "wss://provider.test/responses",
+        status: 101,
+        headers: { "x-ratelimit-remaining-requests": "7", "retry-after": "2", upgrade: "websocket" },
+      })
+      yield* connection.close
+    }),
+  )
+
+  it.effect("leaves handshake headers unknown for a browser-shaped socket", () =>
+    Effect.gen(function* () {
+      // Browsers (and older bun) expose no upgrade event, so there is nothing to
+      // read and the transport must not invent rate-limit metadata.
+      class BrowserSocket extends EventTarget {
+        readyState = globalThis.WebSocket.OPEN
+        send() {}
+        close() {}
+      }
+      const connection = yield* WebSocketTransport.open({
+        url: "wss://provider.test/responses",
+        headers: Headers.empty,
+      }).pipe(
+        // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the socket stands in for the platform constructor's result.
+        Effect.provideService(Socket.WebSocketConstructor, (() => new BrowserSocket()) as never),
+      )
+      expect(connection.http).toBeUndefined()
+      yield* connection.close
+    }),
+  )
+
+  it.effect("preserves opening event errors and native send exceptions", () =>    Effect.gen(function* () {
       const cause = new Error("native send failed")
       class TestSocket extends EventTarget {
         readyState = globalThis.WebSocket.CONNECTING

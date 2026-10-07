@@ -4,8 +4,8 @@ import { Socket } from "effect/unstable/socket"
 import {
   AIError,
   AIErrorReason,
+  HttpContext,
   TransportError,
-  type HttpContext,
   type TransportOperation,
 } from "../../schema/index.js"
 import * as HttpTransport from "./http.js"
@@ -91,6 +91,28 @@ const binaryMessage = (data: unknown) => {
   if (data instanceof ArrayBuffer) return new Uint8Array(data)
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
   return undefined
+}
+
+/**
+ * The handshake response headers a `ws`-style socket publishes on its
+ * `upgrade` event — the only way a WebSocket can advertise rate limits, which
+ * otherwise live only on HTTP responses. Browser-shaped sockets (browsers,
+ * older bun) expose no equivalent, so the capture stays empty there and callers
+ * see no rate-limit metadata rather than fabricated numbers.
+ */
+const captureHandshake = (ws: globalThis.WebSocket): { current?: Headers.Headers } => {
+  const captured: { current?: Headers.Headers } = {}
+  const on = (ws as { on?: (event: string, listener: (response: { headers?: unknown }) => void) => void }).on
+  if (typeof on !== "function") return captured
+  try {
+    on.call(ws, "upgrade", (response) => {
+      const headers = response?.headers
+      if (headers && typeof headers === "object") captured.current = Headers.fromInput(headers as Record<string, string>)
+    })
+  } catch {
+    // Not an EventEmitter-style socket; leave the capture empty.
+  }
+  return captured
 }
 
 const waitOpen = (ws: globalThis.WebSocket, input: WebSocketRequest) => {
@@ -206,12 +228,14 @@ export const open = (input: WebSocketRequest) =>
           delivery: "not-sent",
         }),
     })
-    return yield* fromWebSocket(ws, input)
+    const handshake = captureHandshake(ws)
+    return yield* fromWebSocket(ws, input, () => handshake.current)
   })
 
 export const fromWebSocket = (
   ws: globalThis.WebSocket,
   input: WebSocketRequest,
+  handshake: () => Headers.Headers | undefined = () => undefined,
 ): Effect.Effect<WebSocketConnection, AIError> =>
   Effect.gen(function* () {
     yield* waitOpen(ws, input)
@@ -300,6 +324,16 @@ export const fromWebSocket = (
     ws.addEventListener("close", onClose)
 
     return {
+      // Read lazily: the upgrade event lands after `fromWebSocket` returns, so
+      // the getter resolves against whatever the handshake captured by the time
+      // a caller (or an error) asks for it.
+      get http() {
+        const headers = handshake()
+        if (!headers) return undefined
+        const details = Object.fromEntries(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), String(value)]))
+        if (Object.keys(details).length === 0) return undefined
+        return new HttpContext({ url: input.url, status: 101, headers: details })
+      },
       sendText: (message) =>
         Effect.suspend(() => {
           if (ws.readyState !== globalThis.WebSocket.OPEN)
