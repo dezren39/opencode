@@ -199,6 +199,7 @@ export interface FailureHint {
 
 export const failed = (target: Model.Ref, policy: Policy, now = Date.now(), hint?: FailureHint) => {
   // Quota, rate-limit and provider HTTP errors are not evidence of an internet outage.
+  if (hint?.quota) recordQuota(target, now)
   if (hint?.network) recentFailures.push({ provider: target.providerID, target: key(target), time: now })
   while (recentFailures.length > 200 || (recentFailures[0] && now - recentFailures[0].time > NETWORK_WINDOW_MS))
     recentFailures.shift()
@@ -248,10 +249,65 @@ export const slow = (target: Model.Ref, policy: Policy, now = Date.now()) => {
   }
 }
 
-/** A target is steady while it has at most one give-up among its recent requests. */
-export const steady = (target: Model.Ref) => {
+/** Tunable behaviour. Users never need to set these; they exist so the thresholds can be changed
+ * without a code change. Defaults are what a route does when nothing is configured. */
+export interface Settings {
+  readonly escalation: {
+    /** After this many give-ups in the recent window, a route races its next target at once. */
+    readonly enabled: boolean
+    readonly afterGiveUps: number
+  }
+  readonly quota: {
+    /** Quota errors within `windowMs` that move a target to the end of the route's order. */
+    readonly demoteAfter: number
+    readonly windowMs: number
+  }
+}
+
+const DEFAULT_SETTINGS: Settings = {
+  escalation: { enabled: true, afterGiveUps: 2 },
+  quota: { demoteAfter: 3, windowMs: 4 * 3_600_000 },
+}
+
+let settings: Settings = DEFAULT_SETTINGS
+
+export const configure = (
+  next: Partial<{ escalation: Partial<Settings["escalation"]>; quota: Partial<Settings["quota"]> }>,
+) => {
+  settings = {
+    escalation: { ...settings.escalation, ...next.escalation },
+    quota: { ...settings.quota, ...next.quota },
+  }
+}
+
+export const currentSettings = () => settings
+
+/** Give-ups among a target's recent requests. */
+export const giveUps = (target: Model.Ref) => {
   const state = health.get(key(target))
-  return (state?.outcomes ?? []).filter((answered) => !answered).length <= 1
+  return (state?.outcomes ?? []).filter((answered) => !answered).length
+}
+
+/** A target is steady while it has at most one give-up among its recent requests. */
+export const steady = (target: Model.Ref) => giveUps(target) < settings.escalation.afterGiveUps
+
+/** A route should race its next target immediately when its current target keeps giving up. */
+export const escalates = (target: Model.Ref) => settings.escalation.enabled && !steady(target)
+
+// Quota errors are recorded per target so a provider that keeps saying "out of quota" drops to the end
+// of every order, instead of being retried first on each new session.
+const quotaEvents = new Map<string, number[]>()
+
+/** True when a target has hit its quota errors often enough recently to be put last. */
+export const demoted = (target: Model.Ref, now = Date.now()) => {
+  const recent = (quotaEvents.get(key(target)) ?? []).filter((at) => now - at <= settings.quota.windowMs)
+  return recent.length >= settings.quota.demoteAfter
+}
+
+const recordQuota = (target: Model.Ref, now: number) => {
+  const id = key(target)
+  const recent = (quotaEvents.get(id) ?? []).filter((at) => now - at <= settings.quota.windowMs)
+  quotaEvents.set(id, [...recent, now].slice(-50))
 }
 
 export const completed = (
@@ -283,6 +339,7 @@ export const resetHealth = () => {
   usage.clear()
   adjustments = []
   health.clear()
+  quotaEvents.clear()
   continuity.clear()
   recentFailures.length = 0
 }
@@ -565,10 +622,21 @@ export const skipped = (target: Model.Ref, now = Date.now()) =>
   activeAdjustments(now).some((item) => item.action === "skip" && matches(item, target))
 
 /** Combined weight factor for a target; 1 when nothing applies. */
+const DEMOTED_FACTOR = 0.01
+
 export const weightFactor = (target: Model.Ref, now = Date.now()) =>
   activeAdjustments(now)
     .filter((item) => item.action === "weight" && matches(item, target))
-    .reduce((product, item) => product * (item.factor ?? 1), 1)
+    .reduce((product, item) => product * (item.factor ?? 1), 1) * (demoted(target, now) ? DEMOTED_FACTOR : 1)
+
+/** A session already answered by this target keeps it through a burst rate-limit hold, as long as the
+ * target is still working and not demoted. New sessions go elsewhere; current ones stay where their
+ * cache is, and only move when the target itself starts failing. */
+export const keepsThrough = (routeID: string, sessionID: string | undefined, target: Model.Ref, now = Date.now()) =>
+  sessionID !== undefined &&
+  continuityOf(routeID, sessionID)?.current === key(target) &&
+  steady(target) &&
+  !demoted(target, now)
 
 /** Chooses one leaf lazily. Only groups on the chosen path draw their sticky/rotation entry; nested
  * siblings aren't consumed until failover reaches them. This makes RR and weights compositional. */
@@ -652,7 +720,9 @@ export const nextTarget = (
         ? undefined
         : positions.find((position) => {
             const leaf = node.children[position].leaf
-            return leaf !== undefined && key(definition.targets[leaf]) === current
+            if (leaf === undefined) return false
+            const target = definition.targets[leaf]
+            return key(target) === current && !demoted(target)
           })
     let ordered = positions
     let decisionReason = "ordered"

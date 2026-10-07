@@ -444,3 +444,92 @@ describe("ModelRoute continuity", () => {
     expect(ModelRoute.continuityOf("r", "s4")).toBeUndefined()
   })
 })
+
+describe("ModelRoute burst holds, quota demotion and escalation", () => {
+  const primary = ModelRoute.ref({ providerID: "anthropic", model: "sonnet" })
+  const backup = ModelRoute.ref({ providerID: "openai", model: "fallback" })
+  const policy = ModelRoute.policy({ cooldownMs: 1_000 })
+  const ordered = {
+    id: "burst",
+    targets: [primary, backup],
+    targetVariants: [],
+    health: policy,
+    nodes: [{ selection: "ordered" as const, weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] }],
+  } as unknown as ModelRoute.Definition
+  const both = new Set([0, 1])
+  const spent = (now: number) => ({
+    at: now,
+    limit: { requests: "60" },
+    remaining: { requests: "0" },
+    reset: { requests: "30s" },
+  })
+
+  afterEach(() => {
+    ModelRoute.configure({
+      escalation: { enabled: true, afterGiveUps: 2 },
+      quota: { demoteAfter: 3, windowMs: 4 * 3_600_000 },
+    })
+  })
+
+  test("a session already on a held target keeps it, while a new session goes elsewhere", () => {
+    ModelRoute.resetHealth()
+    const now = 9_000_000
+    ModelRoute.observeRateLimit(primary, spent(now), now)
+    ModelRoute.moved("burst", "old", backup)
+    ModelRoute.served("burst", "old", primary)
+    expect(ModelRoute.keepsThrough("burst", "old", primary, now + 1_000)).toBe(true)
+    expect(ModelRoute.keepsThrough("burst", "new", primary, now + 1_000)).toBe(false)
+  })
+
+  test("a session on a held target moves once that target starts failing", () => {
+    ModelRoute.resetHealth()
+    const now = 9_000_000
+    ModelRoute.observeRateLimit(primary, spent(now), now)
+    ModelRoute.moved("burst", "s", backup)
+    ModelRoute.served("burst", "s", primary)
+    ModelRoute.failed(primary, policy, now)
+    ModelRoute.failed(primary, policy, now)
+    expect(ModelRoute.keepsThrough("burst", "s", primary, now + 1_000)).toBe(false)
+  })
+
+  test("three quota errors within the window put a target last in the order", () => {
+    ModelRoute.resetHealth()
+    const now = Date.now()
+    const quota = { quota: true }
+    ModelRoute.failed(primary, policy, now, quota)
+    ModelRoute.failed(primary, policy, now + 1, quota)
+    expect(ModelRoute.demoted(primary, now + 2)).toBe(false)
+    ModelRoute.failed(primary, policy, now + 2, quota)
+    expect(ModelRoute.demoted(primary, now + 3)).toBe(true)
+    expect(ModelRoute.orderTargets(ordered, both, "new", false)).toEqual([1, 0])
+    // Old quota errors age out of the window, and the target returns to its place.
+    expect(ModelRoute.demoted(primary, now + 4 * 3_600_000 + 10)).toBe(false)
+  })
+
+  test("a demoted target is not kept by a session that was already on it", () => {
+    ModelRoute.resetHealth()
+    const now = Date.now()
+    ModelRoute.moved("burst", "q", backup)
+    ModelRoute.served("burst", "q", primary)
+    for (let index = 0; index < 3; index++) ModelRoute.failed(primary, policy, now + index, { quota: true })
+    expect(ModelRoute.orderTargets(ordered, both, "q", false)).toEqual([1, 0])
+  })
+
+  test("escalation starts once a target has given up twice recently, and can be switched off", () => {
+    ModelRoute.resetHealth()
+    expect(ModelRoute.escalates(primary)).toBe(false)
+    ModelRoute.failed(primary, policy)
+    expect(ModelRoute.escalates(primary)).toBe(false)
+    ModelRoute.failed(primary, policy)
+    expect(ModelRoute.escalates(primary)).toBe(true)
+    ModelRoute.configure({ escalation: { enabled: false } })
+    expect(ModelRoute.escalates(primary)).toBe(false)
+  })
+
+  test("the escalation threshold is tunable", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.configure({ escalation: { afterGiveUps: 1 } })
+    ModelRoute.failed(primary, policy)
+    expect(ModelRoute.escalates(primary)).toBe(true)
+  })
+})
