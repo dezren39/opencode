@@ -18,7 +18,9 @@ import type { StreamOptions } from "@opencode/ai/route"
 import type { SessionCompactionResult } from "@opencode/plugin/effect/session"
 import type { SessionError } from "@opencode/schema/session-error"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { Context, Effect, Layer, Result, Stream } from "effect"
+import { ModelRoute } from "../model-route.js"
+import { ModelRouteLog, type RateLimitSnapshot } from "../model-route-log.js"
+import { Cause, Context, Effect, Exit, Layer, Result, Stream } from "effect"
 import { Agent } from "../agent.js"
 import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
@@ -289,11 +291,11 @@ export const layer = Layer.effect(
       const send = (request: LLMRequest) =>
         Effect.gen(function* () {
           const prompted = LLMRequest.update(request, { messages: [...request.messages, Message.user(prompt)] })
-          const reply = yield* stream(context, prompted, prepared.options)
+          const reply = yield* observedStream(context, prompted, prepared.options, makeObserver(context, "prompt"))
           if (filled(reply.text)) return { ...reply, recent: split.recent }
 
           const nudged = LLMRequest.update(prompted, { messages: [...prompted.messages, Message.user(NUDGE)] })
-          const retry = yield* stream(context, nudged, prepared.options)
+          const retry = yield* observedStream(context, nudged, prepared.options, makeObserver(context, "nudge"))
           if (filled(retry.text)) return { ...retry, recent: split.recent }
           return yield* Effect.fail<Failure>({
             error: {
@@ -503,7 +505,53 @@ export const layer = Layer.effect(
       })
     }
 
-    const stream = (context: SessionContext.Loaded, request: LLMRequest, options: StreamOptions) => {
+    /** One compaction request, observed like any other request so it is not invisible to routing. */
+    const observedStream = (
+      context: SessionContext.Loaded,
+      request: LLMRequest,
+      options: StreamOptions,
+      observed: ReturnType<typeof ModelRouteLog.observer>,
+    ) => {
+      let usage: SessionUsage.Recorded | undefined
+      return stream(context, request, observed.options(options), {
+        onUsage: (recorded) => {
+          usage = usage ? SessionUsage.add(usage, recorded) : recorded
+        },
+      }).pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            observed.done(Exit.isSuccess(exit) ? "success" : Exit.hasInterrupts(exit) ? "interrupted" : "failure", {
+              failure: Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined,
+              outputStarted: textOf(exit).length > 0,
+              tokens: usage?.tokens,
+            })
+          }),
+        ),
+      )
+    }
+
+    const textOf = (exit: Exit.Exit<Streamed, AIError | Failure>) => (Exit.isSuccess(exit) ? exit.value.text : "")
+
+    const makeObserver = (context: SessionContext.Loaded, label: string) =>
+      ModelRouteLog.observer(
+        {
+          routeID: context.model.routing?.routeID ?? "",
+          providerID: context.model.ref.providerID,
+          modelID: context.model.ref.id,
+          variant: context.model.ref.variant,
+          sessionID: context.session.id,
+          assistantMessageID: `compaction-${label}`,
+          startedAt: Date.now(),
+        },
+        (snapshot: RateLimitSnapshot) => ModelRoute.observeRateLimit(context.model.ref, snapshot),
+      )
+
+    const stream = (
+      context: SessionContext.Loaded,
+      request: LLMRequest,
+      options: StreamOptions,
+      hooks?: { onUsage?: (usage: SessionUsage.Recorded) => void },
+    ) => {
       const sessionID = context.session.id
       const metadataKey = context.model.model.route.providerMetadataKey ?? context.model.model.provider
       const unusable = (error: SessionError.Error) => Effect.fail<Failure>({ error })
@@ -529,7 +577,9 @@ export const layer = Layer.effect(
             }
 
             if (LLMEvent.is.stepFinish(event)) {
-              return spend(sessionID, SessionUsage.record(event.usage, context.model.cost)).pipe(
+              const recorded = SessionUsage.record(event.usage, context.model.cost)
+              hooks?.onUsage?.(recorded)
+              return spend(sessionID, recorded).pipe(
                 Effect.as({ ...streamed, providerState: event.providerMetadata?.[metadataKey] }),
               )
             }

@@ -41,15 +41,19 @@ export const RouteAttemptTable = sqliteTable(
     provider_id: text().notNull(),
     model_id: text().notNull(),
     variant: text(),
-    /** `success`, `failure`, `timeout` or `interrupted`. */
+    /** `success`, `failure`, `timeout`, `interrupted`, `hedged-out` or `resolution-failure`. */
     outcome: text().notNull(),
     error_tag: text(),
     error_code: text(),
     error_status: integer(),
     error_message: text(),
+    /** The provider's own explanation, kept only when the caller opts in. */
+    error_body: text(),
     retryable: integer({ mode: "boolean" }),
     output_started: integer({ mode: "boolean" }).notNull(),
     failed_over_to: text(),
+    /** True for both legs of a hedged attempt: the winner and the one cancelled. */
+    hedged: integer({ mode: "boolean" }),
     first_token_ms: real(),
     response_ms: real(),
     tokens_per_second: real(),

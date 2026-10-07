@@ -91,6 +91,18 @@ export const failedAttemptCount = (key?: string) =>
 
 export const clearFailedAttempt = (key: string) => failedAttempts.delete(key)
 
+/** Assistant messages that already ran a hedge race, so a retry of the winner does not race again. */
+const hedgedMessages = new Set<string>()
+export const HEDGED_MESSAGE_LIMIT = 1_000
+
+const markHedged = (messageID: string) => {
+  hedgedMessages.delete(messageID)
+  hedgedMessages.add(messageID)
+  while (hedgedMessages.size > HEDGED_MESSAGE_LIMIT) hedgedMessages.delete(hedgedMessages.values().next().value!)
+}
+
+const wasHedged = (messageID: string) => hedgedMessages.has(messageID)
+
 /**
  * Reads the rate-limit headers of a request's response as soon as the provider answers, so what a
  * successful request said about its quota is kept as well as what a failed one did. Each snapshot is
@@ -120,9 +132,13 @@ export const failureHint = (failure: AIError): ModelRoute.FailureHint => {
     http?: unknown
     code?: string
     message?: string
+    body?: string
   }
   return {
-    retryAfterMs: reason.retryAfterMs ?? reason.rateLimit?.retryAfterMs,
+    retryAfterMs:
+      reason.retryAfterMs ??
+      reason.rateLimit?.retryAfterMs ??
+      ModelRouteLimits.retryHintFromMessage(reason.message ?? reason.body, Date.now()),
     quota: reason._tag === "QuotaExceeded",
     network:
       reason._tag === "Transport" &&
@@ -391,6 +407,7 @@ export const make = Effect.gen(function* () {
                   : undefined,
               tokens_input: tokens?.input,
               tokens_estimated: false,
+              hedged: raced !== undefined,
               tokens_output: tokens?.output,
               tokens_reasoning: tokens?.reasoning,
               tokens_cache_read: tokens?.cache.read,
@@ -564,8 +581,10 @@ export const make = Effect.gen(function* () {
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
     const routing = input.model.routing
     const prepareFor = input.prepareFor
-    if (!routing?.hedgeAfterMs || !prepareFor) return yield* run(input)
+    // Once a turn has been hedged, its retries stay on one request rather than racing again.
+    if (!routing?.hedgeAfterMs || !prepareFor || wasHedged(input.assistantMessageID)) return yield* run(input)
     const primaryLimit = captureRateLimit(input.model.ref)
+    markHedged(input.assistantMessageID)
     const raced = yield* SessionHedge.race({
       primary: llm.stream(input.prepared.request, primaryLimit.options(input.prepared.options)),
       afterMs: routing.hedgeAfterMs,
@@ -606,6 +625,7 @@ export const make = Effect.gen(function* () {
           provider_id: loser?.ref.providerID ?? input.model.ref.providerID,
           model_id: loser?.ref.id ?? input.model.ref.id,
           outcome: "hedged-out",
+          hedged: true,
           output_started: false,
           response_ms: raced.loserElapsedMs,
           tokens_input: input.estimatedInputTokens,

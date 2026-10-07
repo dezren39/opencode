@@ -480,6 +480,26 @@ export const layer = Layer.effect(
           if (Result.isFailure(resolved)) {
             ModelRoute.failed(target, definition.health, now)
             lastError = resolved.failure
+            // A request never went out, but the reason a configured target could not be used is
+            // worth its own record: this is where a broken target shows up as resolution failures.
+            const reason = resolved.failure as { _tag?: string; message?: string }
+            ModelRouteLog.record({
+              kind: "attempt",
+              row: {
+                time_started: now,
+                time_ended: Date.now(),
+                session_id: sessionID,
+                route_id: definition.id,
+                provider_id: target.providerID,
+                model_id: target.id,
+                variant: target.variant,
+                outcome: "resolution-failure",
+                error_tag: reason._tag,
+                error_message: reason.message,
+                retryable: false,
+                output_started: false,
+              },
+            })
             continue
           }
           const current = resolved.success

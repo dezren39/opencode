@@ -86,3 +86,20 @@ describe("ModelRouteLimits.holdUntil", () => {
     expect(ModelRouteLimits.holdUntil(snap({ remaining: { requests: "lots" }, reset: { requests: "1s" } }), at)).toBe(0)
   })
 })
+
+describe("ModelRouteLimits.retryHintFromMessage", () => {
+  const at = 1_000_000
+
+  test("reads waits stated in the error text", () => {
+    expect(ModelRouteLimits.retryHintFromMessage("retry after 2026-01-01T00:00:00Z", at)).toBe(
+      Date.parse("2026-01-01T00:00:00Z") - at,
+    )
+    expect(ModelRouteLimits.retryHintFromMessage("try again in 45 seconds", at)).toBe(45_000)
+    expect(ModelRouteLimits.retryHintFromMessage("wait in 2 hours", at)).toBe(7_200_000)
+  })
+
+  test("does not guess at anything else", () => {
+    expect(ModelRouteLimits.retryHintFromMessage("server exploded", at)).toBeUndefined()
+    expect(ModelRouteLimits.retryHintFromMessage(undefined, at)).toBeUndefined()
+  })
+})

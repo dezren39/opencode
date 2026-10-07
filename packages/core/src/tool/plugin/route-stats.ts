@@ -24,6 +24,8 @@ export type Input = typeof Input.Type
 
 export const Output = Schema.Struct({
   targets: Schema.Array(Schema.Unknown),
+  hedges: Schema.Array(Schema.Unknown),
+  predictions: Schema.Array(Schema.Unknown),
   errors: Schema.Array(Schema.Unknown),
   suggestions: Schema.Array(Schema.Unknown),
   adjustments: Schema.Array(Schema.Unknown),
@@ -51,9 +53,16 @@ export const collect = (input: Input) =>
       Effect.all({
         stats: ModelRouteLog.targetStats(db, since),
         errors: ModelRouteLog.errorBreakdown(db, since),
+        hedges: ModelRouteLog.hedgeAccuracy(db, since),
+        hourly: ModelRouteLog.hourlyStats(db, since),
       }).pipe(Effect.orDie),
     )
-    const { stats, errors } = Option.getOrElse(read, () => ({ stats: [], errors: [] }))
+    const { stats, errors, hedges, hourly } = Option.getOrElse(read, () => ({
+      stats: [],
+      errors: [],
+      hedges: [],
+      hourly: [],
+    }))
     const targets = stats.map((row) => {
       const ref = ModelRoute.ref({ providerID: row.providerID, model: row.modelID })
       const used = ModelRoute.usageOf(ref, now)
@@ -67,9 +76,12 @@ export const collect = (input: Input) =>
         usedLastDay: used.day,
       }
     })
+    const predictions = ModelRouteTuning.predict({ hourly, errors, now })
     const suggestions = ModelRouteTuning.suggest({ stats, errors, now })
     return {
       targets,
+      hedges,
+      predictions,
       errors: errors.map((error) => ({ ...error, lastMessage: error.lastMessage?.slice(0, MESSAGE_LIMIT) ?? null })),
       suggestions,
       adjustments: ModelRoute.activeAdjustments(now),
@@ -100,6 +112,20 @@ const describe = (report: Effect.Success<ReturnType<typeof collect>>, applied: n
         .replace(/\s+/g, " ")
         .trim(),
     )
+  for (const prediction of report.predictions) {
+    if (prediction.state === "busy-hour")
+      lines.push(`predicted: ${prediction.target} is historically unreliable at this hour: ${prediction.detail}`)
+    else if (prediction.until !== undefined)
+      lines.push(
+        `predicted: ${prediction.target} quota returns ${new Date(prediction.until).toISOString()}: ${prediction.detail}`,
+      )
+  }
+  for (const hedge of report.hedges) {
+    const rate = hedge.hedges === 0 ? 0 : Math.round((hedge.wins / hedge.hedges) * 100)
+    lines.push(
+      `hedge accuracy ${hedge.providerID}/${hedge.modelID}: ${hedge.wins}/${hedge.hedges} races won (${rate}%)`,
+    )
+  }
   lines.push(
     report.suggestions.length === 0
       ? "No adjustments suggested."
@@ -135,6 +161,8 @@ export const add = (editor: ToolEditor, permission: Permission.Interface) =>
         return {
           output: {
             targets: report.targets,
+            hedges: report.hedges,
+            predictions: report.predictions,
             errors: report.errors,
             suggestions: report.suggestions,
             adjustments: ModelRoute.activeAdjustments(),

@@ -2,6 +2,8 @@ export * as ModelRouteLog from "./model-route-log.js"
 
 import { and, asc, count, desc, eq, gt, gte, isNull, or, sql } from "drizzle-orm"
 import { Effect, Layer, Queue } from "effect"
+import type { HttpContext } from "@opencode/ai"
+import { RequestExecutor, type StreamOptions } from "@opencode/ai/route"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Database } from "./database/database.js"
 import { RouteAttemptTable, RouteDecisionTable, RouteHealthTable, RouteNoteTable } from "./model-route-log/sql.js"
@@ -38,7 +40,165 @@ export const setSink = (next: Sink | undefined) => {
 
 /** Flattens an `AIError.reason` into the exact tag, code, status, message and body, plus any
  * rate-limit detail the provider reported. */
-export const failureFields = (reason: unknown) => {
+/** Observe one request to a target: read what its response says about rate limits as soon as the
+ * provider answers, and produce the attempt row when it ends. Shared by the runner step and the
+ * background calls (title generation, generate, compaction), so no request is invisible. */
+export interface RequestObservation {
+  readonly routeID: string
+  readonly providerID: string
+  readonly modelID: string
+  readonly variant?: string
+  readonly sessionID?: string
+  readonly assistantMessageID?: string
+  readonly startedAt: number
+  readonly inputTokens?: number
+  /** True for both legs of a hedged attempt. */
+  readonly hedged?: boolean
+  /** Keep the provider's error body. Off by default: it can echo the request. */
+  readonly captureBody?: boolean
+}
+
+export type RateLimitSnapshot = {
+  readonly at: number
+  readonly limit?: Record<string, string>
+  readonly remaining?: Record<string, string>
+  readonly reset?: Record<string, string>
+  readonly retryAfterMs?: number
+}
+
+export const observer = (
+  request: RequestObservation,
+  onRateLimit: (snapshot: RateLimitSnapshot) => void = () => {},
+) => {
+  const seen = observeRateLimits(onRateLimit)
+  return {
+    get snapshot() {
+      return seen.snapshot
+    },
+    options: (base: StreamOptions): StreamOptions => ({
+      ...base,
+      onResponse: (http: HttpContext) => {
+        base.onResponse?.(http)
+        seen.options({}).onResponse?.(http)
+      },
+    }),
+    /** Records the attempt. `failure` is the reason the request failed, if it did. */
+    done: (
+      outcome: "success" | "failure" | "timeout" | "interrupted" | "hedged-out",
+      result: {
+        readonly failure?: unknown
+        readonly outputStarted: boolean
+        readonly firstOutputAt?: number
+        readonly tokens?: {
+          readonly input: number
+          readonly output: number
+          readonly reasoning: number
+          readonly cache: { readonly read: number; readonly write: number }
+        }
+        readonly tokensEstimated?: boolean
+      },
+    ) => {
+      const at = Date.now()
+      const fields: Partial<ReturnType<typeof failureFields>> = result.failure
+        ? failureFields(reasonOf(result.failure), { captureBody: request.captureBody })
+        : {}
+      const tokens = result.tokens
+      record({
+        kind: "attempt",
+        row: {
+          time_started: request.startedAt,
+          time_ended: at,
+          session_id: request.sessionID,
+          assistant_message_id: request.assistantMessageID,
+          route_id: request.routeID,
+          provider_id: request.providerID,
+          model_id: request.modelID,
+          variant: request.variant,
+          outcome,
+          ...fields,
+          // A failed request's own details win; a successful one keeps what its response said.
+          quota: fields.quota ?? (seen.snapshot && { ...seen.snapshot }),
+          retryable: result.failure ? isRetryableHint(result.failure) : undefined,
+          output_started: result.outputStarted,
+          hedged: request.hedged,
+          first_token_ms: result.firstOutputAt === undefined ? undefined : result.firstOutputAt - request.startedAt,
+          response_ms: at - request.startedAt,
+          tokens_per_second:
+            tokens && result.firstOutputAt !== undefined
+              ? ((tokens.output + tokens.reasoning) * 1_000) / Math.max(1, at - result.firstOutputAt)
+              : undefined,
+          tokens_input: tokens ? tokens.input + tokens.cache.read + tokens.cache.write : request.inputTokens,
+          tokens_estimated: result.tokensEstimated ?? (tokens === undefined && request.inputTokens !== undefined),
+          tokens_output: tokens?.output,
+          tokens_reasoning: tokens?.reasoning,
+          tokens_cache_read: tokens?.cache.read,
+          tokens_cache_write: tokens?.cache.write,
+        },
+      })
+    },
+  }
+}
+
+/** Reads a response's rate-limit headers as it arrives, with a place to see the latest snapshot.
+ * Used directly by the background calls; the runner step uses `observer`. */
+export const observeRateLimits = (onRateLimit: (snapshot: RateLimitSnapshot) => void = () => {}) => {
+  let snapshot: RateLimitSnapshot | undefined
+  return {
+    get snapshot() {
+      return snapshot
+    },
+    options: (base: StreamOptions): StreamOptions => ({
+      ...base,
+      onResponse: (http: HttpContext) => {
+        base.onResponse?.(http)
+        const value = rateLimitSnapshot(RequestExecutor.responseRateLimit(http.headers), Date.now())
+        if (!value) return
+        snapshot = value
+        onRateLimit(value)
+      },
+    }),
+  }
+}
+
+const rateLimitSnapshot = (
+  details:
+    | {
+        readonly limit?: Record<string, string>
+        readonly remaining?: Record<string, string>
+        readonly reset?: Record<string, string>
+        readonly retryAfterMs?: number
+      }
+    | undefined,
+  at: number,
+): RateLimitSnapshot | undefined => {
+  if (!details) return undefined
+  const present = (value: Record<string, string> | undefined) =>
+    value && Object.keys(value).length > 0 ? value : undefined
+  const limit = present(details.limit)
+  const remaining = present(details.remaining)
+  const reset = present(details.reset)
+  if (!limit && !remaining && !reset && details.retryAfterMs === undefined) return undefined
+  return {
+    at,
+    ...(limit ? { limit } : {}),
+    ...(remaining ? { remaining } : {}),
+    ...(reset ? { reset } : {}),
+    ...(details.retryAfterMs !== undefined ? { retryAfterMs: details.retryAfterMs } : {}),
+  }
+}
+
+/** A failure arrives as an `AIError` or as its `reason`; the reason is what carries the details. */
+const reasonOf = (failure: unknown) => {
+  const value = (failure ?? {}) as { reason?: unknown }
+  return value.reason ?? failure
+}
+
+const isRetryableHint = (failure: unknown) => {
+  const reason = (failure ?? {}) as { reason?: { _tag?: string } }
+  return reason.reason?._tag !== undefined
+}
+
+export const failureFields = (reason: unknown, options?: { readonly captureBody?: boolean }) => {
   const value = (reason ?? {}) as Record<string, unknown>
   const http = value.http as { status?: unknown; headers?: unknown } | undefined
   const rateLimit = value.rateLimit as Record<string, unknown> | undefined
@@ -62,6 +222,8 @@ export const failureFields = (reason: unknown) => {
     error_code: typeof value.code === "string" ? value.code : undefined,
     error_status: typeof http?.status === "number" ? http.status : undefined,
     error_message: typeof value.message === "string" ? value.message : undefined,
+    // Kept only when the caller asks: a provider body can echo the request, so it is opt-in.
+    error_body: options?.captureBody && typeof value.body === "string" ? value.body.slice(0, 2_000) : undefined,
     quota,
   }
 }
@@ -240,6 +402,69 @@ export const targetStats = (db: Database.Interface["db"], since: number, routeID
       and(gte(RouteAttemptTable.time_started, since), routeID ? eq(RouteAttemptTable.route_id, routeID) : undefined),
     )
     .groupBy(RouteAttemptTable.provider_id, RouteAttemptTable.model_id)
+    .all()
+
+export interface HedgeAccuracy {
+  readonly providerID: string
+  readonly modelID: string
+  /** Attempts where this target was one leg of a hedged pair. */
+  readonly hedges: number
+  /** Times it was the leg that answered. */
+  readonly wins: number
+}
+
+/**
+ * How often each target won the race when it was hedged against another, from the pairs of
+ * `hedged` rows that share an assistant message: one `hedged-out` loser and one `success` winner.
+ * This is the record of what hedging predicted against how it turned out.
+ */
+export const hedgeAccuracy = (db: Database.Interface["db"], since: number, routeID?: string) =>
+  db
+    .select({
+      providerID: RouteAttemptTable.provider_id,
+      modelID: RouteAttemptTable.model_id,
+      hedges: count(),
+      wins: sql<number>`sum(case when ${RouteAttemptTable.outcome} = 'success' then 1 else 0 end)`,
+    })
+    .from(RouteAttemptTable)
+    .where(
+      and(
+        gte(RouteAttemptTable.time_started, since),
+        sql`${RouteAttemptTable.hedged} is true`,
+        sql`${RouteAttemptTable.assistant_message_id} is not null`,
+        sql`exists (select 1 from route_attempt rival where rival.assistant_message_id = ${RouteAttemptTable.assistant_message_id} and rival.hedged is true and (rival.provider_id != ${RouteAttemptTable.provider_id} or rival.model_id != ${RouteAttemptTable.model_id}))`,
+        routeID ? eq(RouteAttemptTable.route_id, routeID) : undefined,
+      ),
+    )
+    .groupBy(RouteAttemptTable.provider_id, RouteAttemptTable.model_id)
+    .all()
+
+export interface HourlyStat {
+  readonly providerID: string
+  readonly modelID: string
+  readonly hour: number
+  readonly attempts: number
+  readonly failures: number
+}
+
+/** Failure counts by hour of day, so a target that only fails at certain times can be told apart
+ * from one that fails all the time. */
+export const hourlyStats = (db: Database.Interface["db"], since: number) =>
+  db
+    .select({
+      providerID: RouteAttemptTable.provider_id,
+      modelID: RouteAttemptTable.model_id,
+      hour: sql<number>`cast(strftime('%H', ${RouteAttemptTable.time_started} / 1000, 'unixepoch') as integer)`,
+      attempts: count(),
+      failures: sql<number>`sum(case when ${RouteAttemptTable.outcome} in ('failure','timeout') then 1 else 0 end)`,
+    })
+    .from(RouteAttemptTable)
+    .where(gte(RouteAttemptTable.time_started, since))
+    .groupBy(
+      RouteAttemptTable.provider_id,
+      RouteAttemptTable.model_id,
+      sql`cast(strftime('%H', ${RouteAttemptTable.time_started} / 1000, 'unixepoch') as integer)`,
+    )
     .all()
 
 /** Most recent failures with their exact code and message, newest first. */

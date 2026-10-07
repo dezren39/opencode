@@ -60,6 +60,36 @@ export const resetMs = (value: string, at: number): number | undefined => {
   return Number.isNaN(date) ? undefined : Math.max(0, date - at)
 }
 
+const ABSOLUTE_TIME =
+  /(?:retry|try again|wait|back|resume|reset|returns?|until|expires?(?: at)?)[a-z ]{0,20}(?:after|at|on|by)?\s*(\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2})?)?)/
+const RELATIVE_TIME = /in\s+(\d+)\s*(second|minute|hour|day)s?/
+const RELATIVE_UNITS = { second: 1_000, minute: 60_000, hour: 3_600_000, day: 86_400_000 } as Record<string, number>
+
+/**
+ * The instant a provider said a limit returns, from the text of its error or a user's note: an
+ * absolute time ("reset at 2026-01-01T00:00:00Z", "back on 2026-01-01") or a relative one ("in 3
+ * hours"). Undefined when the text states no time. Absolute times are honoured as written.
+ */
+export const resetAtFromMessage = (message: string | undefined, now: number): number | undefined => {
+  if (!message) return undefined
+  const absolute = ABSOLUTE_TIME.exec(message.toLowerCase())?.[1]
+  if (absolute) {
+    const date = Date.parse(absolute)
+    if (!Number.isNaN(date)) return date
+  }
+  const relative = RELATIVE_TIME.exec(message.toLowerCase())
+  return relative ? now + Number(relative[1]) * (RELATIVE_UNITS[relative[2]] ?? 1_000) : undefined
+}
+
+/**
+ * A wait time a provider stated in the text of its error, for cases where the headers say nothing.
+ * Never negative: an absolute time in the past means no wait at all.
+ */
+export const retryHintFromMessage = (message: string | undefined, now: number): number | undefined => {
+  const at = resetAtFromMessage(message, now)
+  return at === undefined ? undefined : Math.max(0, at - now)
+}
+
 const MAX_WINDOW_MS = 86_400_000
 /** With nothing said about when it resets, an emptied window is assumed to last this long. */
 const UNKNOWN_RESET_MS = 60_000
