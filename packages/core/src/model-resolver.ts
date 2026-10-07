@@ -456,11 +456,13 @@ export const layer = Layer.effect(
             const isSkipped = rules && ModelRoute.skipped(target, now)
             const isOverBudget = rules && ModelRoute.overBudget(target, definition.budgets?.[index], now)
             const limited = rules ? ModelRoute.limitedUntil(target, now) : 0
+            // A burst hold steers new sessions away but leaves a session on the target it is already using.
+            const kept = limited > now && ModelRoute.keepsThrough(definition.id, sessionID, target, now)
             if (until > now) unavailable.set(index, `cooldown-until:${until}`)
-            else if (limited > now) unavailable.set(index, `provider-limit-until:${limited}`)
+            else if (limited > now && !kept) unavailable.set(index, `provider-limit-until:${limited}`)
             else if (isSkipped) unavailable.set(index, "user-skip")
             else if (isOverBudget) unavailable.set(index, "soft-budget")
-            return until <= now && limited <= now && !isSkipped && !isOverBudget
+            return until <= now && (limited <= now || kept) && !isSkipped && !isOverBudget
           })
           // Budgets and skips are soft limits: if every remaining target is excluded, try the
           // configured tree as a last resort rather than refusing a turn.

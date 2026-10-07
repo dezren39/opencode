@@ -593,13 +593,16 @@ export const make = Effect.gen(function* () {
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
     const routing = input.model.routing
     const prepareFor = input.prepareFor
+    // A target that keeps giving up is raced at once rather than after the hedge delay.
+    const escalate = routing !== undefined && ModelRoute.escalates(routing.target)
     // Once a turn has been hedged, its retries stay on one request rather than racing again.
-    if (!routing?.hedgeAfterMs || !prepareFor || wasHedged(input.assistantMessageID)) return yield* run(input)
+    if (!routing || (!routing.hedgeAfterMs && !escalate) || !prepareFor || wasHedged(input.assistantMessageID))
+      return yield* run(input)
     const primaryLimit = captureRateLimit(input.model.ref)
     markHedged(input.assistantMessageID)
     const raced = yield* SessionHedge.race({
       primary: llm.stream(input.prepared.request, primaryLimit.options(input.prepared.options)),
-      afterMs: routing.hedgeAfterMs,
+      afterMs: escalate ? 0 : (routing.hedgeAfterMs ?? 0),
       deadlineMs: typeof routing.policy.firstTokenTimeoutMs === "number" ? routing.policy.firstTokenTimeoutMs : 60_000,
       // No next target, or one that cannot be prepared, simply means there is nothing to hedge with.
       // A session that just moved races its origin, where its cache is, rather than the next fallback.
