@@ -463,9 +463,21 @@ export const limitedUntil = (target: Model.Ref, now = Date.now()) => {
 /** The latest rate-limit snapshot seen for the target, if any. */
 export const rateLimitOf = (target: Model.Ref) => limits.get(key(target))?.snapshot
 
-/** Re-applies windows that were still holding targets back when the process last stopped. */
-export const seedLimits = (rows: ReadonlyArray<{ providerID: string; modelID: string; until: number }>) => {
-  for (const row of rows) limits.set(key(ref({ providerID: row.providerID, model: row.modelID })), { until: row.until })
+/** Re-applies windows that were still holding targets back when the process last stopped, with the
+ * snapshot that produced them, so a cold target still has the provider's last word. */
+export const seedLimits = (
+  rows: ReadonlyArray<{
+    providerID: string
+    modelID: string
+    until: number
+    snapshot?: ModelRouteLimits.Snapshot
+  }>,
+) => {
+  for (const row of rows)
+    limits.set(key(ref({ providerID: row.providerID, model: row.modelID })), {
+      until: row.until,
+      ...(row.snapshot ? { snapshot: row.snapshot } : {}),
+    })
 }
 
 /** An expiring operator or agent instruction about which targets to use. `match` is a case-insensitive

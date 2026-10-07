@@ -308,7 +308,9 @@ current target has produced no output after that long, the same request is sent 
 the next target and the first to answer wins; the other is cancelled. Both run
 unseen, so nothing is shown and no tool runs until a winner is known. It costs a
 duplicate request whenever the first target is slow, and a target that keeps
-losing counts as slow and cools down. It is off by default.
+losing counts as slow and cools down. It is off by default. The start of the race
+is recorded as a `hedge-started` decision naming both targets, so the attempt is
+visible even if the loser never produces an event.
 
 OpenCode also reads the rate-limit headers of every response, successful ones
 included (OpenAI-style `x-ratelimit-*` and Anthropic-style `anthropic-ratelimit-*`
@@ -318,7 +320,11 @@ traffic moves before the provider starts refusing it. This is the provider's own
 forecast, not a failure: nothing is cooled or counted against the target. If every
 target in a route is held back, the first still answers rather than the turn
 failing. Windows survive a restart until they reset, and the latest report for each
-target is stored with its attempt and shown by `route_stats`.
+target is stored with its attempt and shown by `route_stats`. The latest snapshot
+for each target is restored after a restart, so a target the new process has not
+used yet still carries the provider's last word. Rejected requests expose the
+same hook as successful ones (`onRejected` mirrors `onResponse`), so a mid-stream
+429 moves traffic just like a slow success does.
 
 A provider's own timing is believed: a rate limit's `retry-after` sets the
 cooldown (up to a day), and a target that reports an exhausted quota is skipped

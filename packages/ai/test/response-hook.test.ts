@@ -90,6 +90,49 @@ describe("StreamOptions.onResponse", () => {
   )
 })
 
+describe("StreamOptions.onRejected", () => {
+  it.effect("reports a rejected request with its failure, including headers and rate limits", () =>
+    Effect.gen(function* () {
+      const seen: string[] = []
+      const rejected = dynamicResponse((input) =>
+        Effect.succeed(
+          input.respond("{}", {
+            status: 429,
+            headers: { "retry-after": "5", "x-ratelimit-remaining-requests": "0" },
+          }),
+        ),
+      )
+      const error = yield* LLMClient.stream(request, {
+        onRejected: (failure) => {
+          seen.push(failure.reason._tag)
+        },
+      }).pipe(Stream.runCollect, Effect.provide(rejected), Effect.flip)
+      expect(error.reason).toMatchObject({ _tag: "RateLimit" })
+      expect(seen).toEqual(["RateLimit"])
+    }),
+  )
+
+  it.effect("an observer that throws cannot break the rejection it observes", () =>
+    Effect.gen(function* () {
+      const rejected = dynamicResponse((input) => Effect.succeed(input.respond("{}", { status: 429 })))
+      const error = yield* LLMClient.stream(request, {
+        onRejected: () => {
+          throw new Error("observer failed")
+        },
+      }).pipe(Stream.runCollect, Effect.provide(rejected), Effect.flip)
+      expect(error.reason._tag).toBe("RateLimit")
+    }),
+  )
+
+  it.effect("is optional", () =>
+    Effect.gen(function* () {
+      const rejected = dynamicResponse((input) => Effect.succeed(input.respond("{}", { status: 429 })))
+      const error = yield* LLMClient.stream(request).pipe(Stream.runCollect, Effect.provide(rejected), Effect.flip)
+      expect(error.reason._tag).toBe("RateLimit")
+    }),
+  )
+})
+
 describe("StreamOptions.onResponse over the websocket transport", () => {
   it.effect("reports the handshake response's headers, so its rate limits are readable too", () =>
     Effect.gen(function* () {

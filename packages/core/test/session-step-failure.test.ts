@@ -117,6 +117,21 @@ describe("SessionStep.captureRateLimit", () => {
     expect(ModelRoute.rateLimitOf(target)).toBeUndefined()
   })
 
+  test("a rejection's own headers update rate-limit state like a success's do", () => {
+    ModelRoute.resetHealth()
+    const { capture, options } = SessionStep.captureRateLimit(target)
+    options({}).onRejected?.(
+      new AIError({
+        reason: new RateLimitError({
+          message: "slow down",
+          rateLimit: { limit: { requests: "60" }, remaining: { requests: "0" }, reset: { requests: "45s" } },
+        }),
+      }),
+    )
+    expect(capture.snapshot).toMatchObject({ remaining: { requests: "0" }, reset: { requests: "45s" } })
+    expect(ModelRoute.limitedUntil(target)).toBeGreaterThan(Date.now() + 40_000)
+  })
+
   test("still calls an existing observer", () => {
     ModelRoute.resetHealth()
     const seen: number[] = []

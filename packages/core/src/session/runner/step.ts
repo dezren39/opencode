@@ -9,10 +9,8 @@ import {
   TransportError,
   UnknownProviderError,
   type ProviderErrorEvent,
-  type HttpContext,
   type ToolCall,
 } from "@opencode/ai"
-import { RequestExecutor, type StreamOptions } from "@opencode/ai/route"
 import type { Agent } from "@opencode/schema/agent"
 import { Cause, Clock, Data, Deferred, Duration, Effect, Exit, Fiber, Option, Result, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
@@ -108,19 +106,19 @@ const wasHedged = (messageID: string) => hedgedMessages.has(messageID)
  * successful request said about its quota is kept as well as what a failed one did. Each snapshot is
  * handed to the routing state immediately: a spent window holds the target back for the next turn.
  */
+''/** Reads a response's rate-limit headers as it arrives, and a rejection's own headers too. Kept
+ * as the step's name for it so existing callers and tests keep working; the implementation is the
+ * shared observer from `ModelRouteLog`, which handles both `onResponse` and `onRejected`. */
+''/** Reads a response's rate-limit headers as it arrives, and a rejection's own headers too. Kept
+ * as the step's name for it so existing callers and tests keep working; the implementation is the
+ * shared observer from `ModelRouteLog`, which handles both `onResponse` and `onRejected`. */
 export const captureRateLimit = (target: ModelRoute.Target) => {
   const capture: { snapshot?: ModelRouteLimits.Snapshot } = {}
-  const options = (base: StreamOptions): StreamOptions => ({
-    ...base,
-    onResponse: (http: HttpContext) => {
-      base.onResponse?.(http)
-      const snapshot = ModelRouteLimits.snapshot(RequestExecutor.responseRateLimit(http.headers), Date.now())
-      if (!snapshot) return
-      capture.snapshot = snapshot
-      ModelRoute.observeRateLimit(target, snapshot)
-    },
+  const seen = ModelRouteLog.observeRateLimits((snapshot) => {
+    capture.snapshot = snapshot
+    ModelRoute.observeRateLimit(target, snapshot)
   })
-  return { capture, options }
+  return { capture, options: seen.options }
 }
 
 /** Cooldown input from a provider error: a stated retry-after, or an exhausted quota. */
@@ -597,6 +595,22 @@ export const make = Effect.gen(function* () {
             : prepareFor(next).pipe(
                 Effect.map((prepared) => {
                   const rateLimit = captureRateLimit(next.ref)
+                  // A hedge has begun: both targets are named before either answers, so the race
+                  // itself is visible even if the loser never produces an event.
+                  ModelRouteLog.record({
+                    kind: "decision",
+                    row: {
+                      time: Date.now(),
+                      session_id: input.sessionID,
+                      route_id: routing.routeID,
+                      selection: "hedge-race",
+                      candidates: [
+                        `${input.model.ref.providerID}/${input.model.ref.id}`,
+                        `${next.ref.providerID}/${next.ref.id}`,
+                      ],
+                      reason: "hedge-started" as const,
+                    },
+                  })
                   return Option.some({
                     value: { model: next, prepared, rateLimit },
                     stream: llm.stream(prepared.request, rateLimit.options(prepared.options)),
