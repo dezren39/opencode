@@ -55,6 +55,8 @@ const Definition = Schema.Struct({
   health: Policy,
   attempts: Schema.Finite.pipe(optional),
   hedgeAfterMs: Schema.Finite.pipe(optional),
+  /** Decision level of the route; see ModelRouteAutonomy. Unset keeps every rule on. */
+  autonomy: Schema.Literals(["fixed", "rules", "adaptive", "predictive", "agent"]).pipe(optional),
   /** Parallel to `targets`; an empty object means unlimited. */
   budgets: Schema.Array(Budget).pipe(optional),
   nodes: Schema.Array(Node),

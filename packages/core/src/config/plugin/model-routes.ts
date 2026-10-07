@@ -12,6 +12,7 @@ import { Provider } from "../../provider.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
 import { Permission } from "../../permission.js"
 import { ModelRouteTuning } from "../../model-route-tuning.js"
+import { ModelRouteAutonomy } from "../../model-route-autonomy.js"
 import { RouteAdjustTool } from "../../tool/plugin/route-adjust.js"
 import { RouteStatsTool } from "../../tool/plugin/route-stats.js"
 
@@ -38,10 +39,15 @@ export const Plugin = define({
     )
 
     // Scheduled review of the routing history, off unless configured.
-    yield* ModelRouteTuning.schedule(() => configuredTuning(loaded.entries)).pipe(Effect.forkScoped)
+    yield* ModelRouteTuning.schedule(
+      () => configuredTuning(loaded.entries),
+      () => Array.from(configuredRoutes(loaded.entries).values(), (route) => route.autonomy),
+    ).pipe(Effect.forkScoped)
 
     yield* ctx.tool.transform((editor) => {
-      if (configuredRoutes(loaded.entries).size === 0) return
+      const routes = configuredRoutes(loaded.entries)
+      if (routes.size === 0) return
+      if (!ModelRouteAutonomy.offersTools(Array.from(routes.values(), (route) => route.autonomy))) return
       RouteAdjustTool.add(editor, permission)
       RouteStatsTool.add(editor, permission)
     })
@@ -73,6 +79,7 @@ export const Plugin = define({
               nodes,
               attempts: route.attempts ?? 1,
               ...(route.hedgeAfterMs ? { hedgeAfterMs: route.hedgeAfterMs } : {}),
+              ...(route.autonomy ? { autonomy: route.autonomy } : {}),
               budgets: expanded.map((target) => target.budget ?? {}),
             },
           },
@@ -154,14 +161,14 @@ function expand(
       children: ModelRoute.Node["children"][number][]
     } = {
       routeID,
-      selection: current.selection ?? "ordered",
+      selection: ModelRouteAutonomy.usesRules(current.autonomy) ? (current.selection ?? "ordered") : "ordered",
       weights: [],
       children: [],
     }
     nodes.push(node)
     const attach = (child: ModelRoute.Node["children"][number], key: string) => {
       node.children.push(child)
-      node.weights.push(current.weights?.[key] ?? 1)
+      node.weights.push(ModelRouteAutonomy.usesRules(current.autonomy) ? (current.weights?.[key] ?? 1) : 1)
     }
     for (const target of current.targets) {
       const spec = targetSpec(target)
@@ -197,7 +204,10 @@ function expand(
       // Budgets belong to the target: the outermost route that declares one wins, wherever the
       // target was first reached.
       const budget = plainBudget(
-        [...nextTrail].map((id) => routes.get(id)?.budgets?.[leafKey]).find((value) => value !== undefined),
+        [...nextTrail]
+          .filter((id) => ModelRouteAutonomy.usesRules(routes.get(id)?.autonomy))
+          .map((id) => routes.get(id)?.budgets?.[leafKey])
+          .find((value) => value !== undefined),
       )
       result.push({
         ...(budget ? { budget } : {}),

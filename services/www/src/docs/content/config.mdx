@@ -283,6 +283,22 @@ providers, sends 75% of new sessions to `luna` and about 25% to each Luna
 provider. A group with nothing healthy drops out and its weight goes to its
 siblings.
 
+Set `autonomy` on a route to choose how much it decides for itself. Each level
+includes the ones before it:
+
+| Level        | The route may                                                                              |
+| ------------ | ------------------------------------------------------------------------------------------ |
+| `fixed`      | Use the configured order and fail over on errors. Weights, budgets and holds are ignored.  |
+| `rules`      | Also use selection modes, weights, budgets and provider rate-limit holds.                  |
+| `adaptive`   | Also be reviewed on a schedule: failing or slow targets are skipped or down-weighted.      |
+| `predictive` | Also learn hours of the day when a target is unreliable, and read reset times from errors. |
+| `agent`      | Also expose `route_stats` and `route_adjust`, so the model can inspect and steer routing.  |
+
+A route with no `autonomy` keeps every rule on and offers the agent tools, as before
+levels existed. The scheduled review runs when `model_route_tuning.enabled` is true
+or any route is `adaptive` or higher. Real failures always cool a target down, at
+every level, so a `fixed` route still fails over.
+
 Set `attempts` (default 1) to retry a target that many times before the route
 moves on. Retries only happen before any output, so a tool call never runs
 twice. A target that fails is not penalized until its attempts are used up.

@@ -88,6 +88,10 @@ export class Route extends Schema.Class<Route>("Config.ModelRoute.Route")({
     description:
       "Requests to make against one target before failing over to the next. Defaults to 1. Retries only happen before any response output, so no tool call ever runs twice.",
   }),
+  autonomy: Schema.Literals(["fixed", "rules", "adaptive", "predictive", "agent"]).pipe(optional).annotate({
+    description:
+      "How much the route may decide for itself; each level includes the ones before it. fixed: configured order with failover only. rules: adds selection modes, weights, budgets and provider rate-limit holds. adaptive: adds the scheduled review that skips or down-weights targets from recent history. predictive: adds time-of-day and error-text prediction. agent: adds route_stats and route_adjust so the model can inspect and steer routing. Unset keeps the behavior from before levels existed.",
+  }),
   selection: Schema.Literals(["ordered", "round-robin", "weighted"]).pipe(optional).annotate({
     description:
       "How a session picks its target: ordered uses the configured order (default), round-robin rotates per new session, weighted draws by weights. Either way the choice is sticky for the session and failover falls through the remaining targets in order.",

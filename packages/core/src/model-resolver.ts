@@ -12,6 +12,7 @@ import type { RuntimeInfo } from "./model.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
 import { ModelRoute } from "./model-route.js"
+import { ModelRouteAutonomy } from "./model-route-autonomy.js"
 import { ModelRouteLog } from "./model-route-log.js"
 
 export class VariantUnavailableError extends Schema.TaggedError<VariantUnavailableError>()(
@@ -443,9 +444,11 @@ export const layer = Layer.effect(
           const ready = indexes.filter((index) => {
             const target = definition.targets[index]
             const until = ModelRoute.cooldownUntil(target, now)
-            const isSkipped = ModelRoute.skipped(target, now)
-            const isOverBudget = ModelRoute.overBudget(target, definition.budgets?.[index], now)
-            const limited = ModelRoute.limitedUntil(target, now)
+            // A fixed route only fails over: provider holds, skips and budgets are rules and above.
+            const rules = ModelRouteAutonomy.usesRules(definition.autonomy)
+            const isSkipped = rules && ModelRoute.skipped(target, now)
+            const isOverBudget = rules && ModelRoute.overBudget(target, definition.budgets?.[index], now)
+            const limited = rules ? ModelRoute.limitedUntil(target, now) : 0
             if (until > now) unavailable.set(index, `cooldown-until:${until}`)
             else if (limited > now) unavailable.set(index, `provider-limit-until:${limited}`)
             else if (isSkipped) unavailable.set(index, "user-skip")

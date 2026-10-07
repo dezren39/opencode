@@ -4,6 +4,7 @@ import { Duration, Effect, Option } from "effect"
 import { ModelRoute } from "./model-route.js"
 import { ModelRouteLog, type ErrorBreakdown, type HourlyStat, type TargetStats } from "./model-route-log.js"
 import { ModelRouteLimits } from "./model-route-limits.js"
+import { ModelRouteAutonomy } from "./model-route-autonomy.js"
 
 /** Adjustments the routing history argues for. Deterministic and conservative: they only ever
  * lower a target's share or skip it, they expire on their own, and each is replaced (same id) by
@@ -224,6 +225,8 @@ export const review = (options: {
   readonly windowHours: number
   readonly holdMs: number
   readonly notes?: readonly string[]
+  /** Skip time-of-day and error-text prediction. Defaults to false. */
+  readonly withoutPredictions?: boolean
 }) =>
   Effect.gen(function* () {
     const now = Date.now()
@@ -237,7 +240,7 @@ export const review = (options: {
     const readHourly = yield* ModelRouteLog.withDb((db) => ModelRouteLog.hourlyStats(db, since).pipe(Effect.orDie))
     const { stats, errors } = Option.getOrElse(read, () => ({ stats: [], errors: [] }))
     const hourly = Option.getOrElse(readHourly, () => [] as ModelRouteLog.HourlyStat[])
-    const predictions = predict({ hourly, errors, now })
+    const predictions = options.withoutPredictions ? [] : predict({ hourly, errors, now })
     const suggestions = suggest({ stats, errors, now, holdMs: options.holdMs })
     suggestions.push(...noteAdjustments(parseNotes(options.notes), now, options.holdMs))
     // A target that has been unreliable at this hour is down-weighted for a while, and one whose
@@ -267,18 +270,22 @@ export const review = (options: {
 
 /** Reviews on a schedule for as long as the scope lives. The settings are read again before every
  * cycle, so enabling, disabling or retiming takes effect without a restart. */
-export const schedule = (read: () => Settings | undefined) =>
+export const schedule = (
+  read: () => Settings | undefined,
+  levels: () => readonly (ModelRouteAutonomy.Level | undefined)[] = () => [],
+) =>
   Effect.gen(function* () {
     while (true) {
       const interval = Math.max(1, read()?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES)
       yield* Effect.sleep(Duration.minutes(interval))
       const settings = read()
-      if (!settings?.enabled) continue
+      if (!ModelRouteAutonomy.reviews(levels(), settings?.enabled === true)) continue
       const applied = yield* review({
-        notes: settings.notes,
-        windowHours: settings.windowHours ?? DEFAULT_WINDOW_HOURS,
+        notes: settings?.notes,
+        withoutPredictions: !ModelRouteAutonomy.predicts(levels()),
+        windowHours: settings?.windowHours ?? DEFAULT_WINDOW_HOURS,
         // Long enough to bridge to the next review, so an adjustment does not flicker off in between.
-        holdMs: Math.max(1, settings.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES) * 2 * 60_000,
+        holdMs: Math.max(1, settings?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES) * 2 * 60_000,
       }).pipe(Effect.catchCause(() => Effect.succeed([] as ModelRoute.Adjustment[])))
       if (applied.length > 0)
         yield* Effect.logInfo("model route tuning applied adjustments", {

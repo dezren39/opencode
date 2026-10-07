@@ -1667,6 +1667,33 @@ describe("ModelResolver routes", () => {
     )
   })
 
+  it.effect("a fixed route only fails over: skips, budgets and provider holds apply from rules up", () => {
+    ModelRoute.resetHealth()
+    const a = leaf("pa")
+    const b = leaf("pb")
+    const spend = () => {
+      ModelRoute.setAdjustments([{ id: "x", match: "pa", action: "skip", until: Date.now() + 60_000 }])
+      ModelRoute.observeRateLimit(ModelRoute.ref({ providerID: "pa", model: a.id }), {
+        at: Date.now(),
+        limit: { requests: "60" },
+        remaining: { requests: "0" },
+        reset: { requests: "1h" },
+      })
+    }
+    const fixed = routed([a, b], { ...ordered, autonomy: "fixed" })
+    const rules = routed([a, b], { ...ordered, autonomy: "rules" })
+    return withResolver([a, b], (resolver) =>
+      Effect.gen(function* () {
+        spend()
+        expect(targetOf(yield* resolver.resolveModel(rules))).toBe("pb")
+        expect(targetOf(yield* resolver.resolveModel(fixed))).toBe("pa")
+        // A real failure still moves a fixed route along.
+        ModelRoute.failed(ModelRoute.ref({ providerID: "pa", model: a.id }), ModelRoute.policy(), Date.now())
+        expect(targetOf(yield* resolver.resolveModel(fixed))).toBe("pb")
+      }),
+    )
+  })
+
   it.effect("gives each new session its own target in round-robin mode and keeps it", () => {
     ModelRoute.resetHealth()
     ModelRoute.resetSelection()
