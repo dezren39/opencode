@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect, Exit } from "effect"
 import { Database } from "@opencode/core/database/database"
 import { ModelRoute } from "@opencode/core/model-route"
@@ -46,8 +46,14 @@ describe("ModelRouteLog", () => {
           ...ModelRouteLog.failureFields({
             _tag: "QuotaExceeded",
             message: "You exceeded your current quota",
-            body: '{"error":{"code":"insufficient_quota"}}',
-            http: { status: 429, headers: { "x-ratelimit-remaining-tokens": "0" } },
+            http: {
+              status: 429,
+              headers: {
+                "x-ratelimit-remaining-tokens": "0",
+                "retry-after": "60",
+                "set-cookie": "must-not-be-persisted",
+              },
+            },
           }),
         }),
       })
@@ -65,9 +71,9 @@ describe("ModelRouteLog", () => {
         error_tag: "QuotaExceeded",
         error_status: 429,
         error_message: "You exceeded your current quota",
-        error_body: '{"error":{"code":"insufficient_quota"}}',
-        quota: { headers: { "x-ratelimit-remaining-tokens": "0" } },
+        quota: { headers: { "x-ratelimit-remaining-tokens": "0", "retry-after": "60" } },
       })
+      expect(attempts.find((row) => row.outcome === "failure")?.error_body).toBeNull()
 
       const stats = yield* ModelRouteLog.targetStats(db, 0, "luna")
       expect(stats).toHaveLength(1)
@@ -240,6 +246,44 @@ describe("route stats tool permission", () => {
       expect(ModelRoute.activeAdjustments().map((item) => item.id)).toContain("auto:denied/m")
     }),
   )
+})
+
+describe("ModelRouteLog.failureFields", () => {
+  test("keeps quota headers, not arbitrary response headers or bodies", () => {
+    const fields = ModelRouteLog.failureFields({
+      _tag: "RateLimit",
+      message: "rate limited",
+      code: "429",
+      body: "may echo request content",
+      http: {
+        status: 429,
+        headers: {
+          "x-ratelimit-limit-requests": "100",
+          "x-ratelimit-remaining-requests": "0",
+          "retry-after-ms": "5000",
+          "set-cookie": "private",
+          authorization: "secret",
+        },
+      },
+    })
+    expect(fields).toMatchObject({
+      error_tag: "RateLimit",
+      error_code: "429",
+      error_status: 429,
+      error_message: "rate limited",
+      quota: {
+        headers: {
+          "x-ratelimit-limit-requests": "100",
+          "x-ratelimit-remaining-requests": "0",
+          "retry-after-ms": "5000",
+        },
+      },
+    })
+    expect(fields).not.toHaveProperty("error_body")
+    expect(JSON.stringify(fields)).not.toContain("private")
+    expect(JSON.stringify(fields)).not.toContain("secret")
+    expect(JSON.stringify(fields)).not.toContain("may echo")
+  })
 })
 
 describe("cooldown restore", () => {

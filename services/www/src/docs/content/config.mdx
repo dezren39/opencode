@@ -344,9 +344,9 @@ restarts until they expire.
 
 OpenCode records routing history in its database for analysis and tuning:
 `route_decision` (what was eligible, what was drawn and why), `route_attempt`
-(per request: exact error tag, code, HTTP status, message and response body,
-rate-limit details, first-token and total latency, tokens per second, and
-input, output, reasoning and cache token counts), `route_health` (cooldown
+(per request: exact error tag, code, HTTP status and message, whitelisted rate-limit
+headers, first-token and total latency, tokens per second, and input, output,
+reasoning and cache token counts), `route_health` (cooldown
 starts, ends and network-suspect events) and `route_note` (adjustments).
 Rows carry the session and assistant message IDs so they join to the session
 tables, which already hold per-step usage and cost. Prompts and responses are

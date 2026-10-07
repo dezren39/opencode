@@ -42,17 +42,26 @@ export const failureFields = (reason: unknown) => {
   const value = (reason ?? {}) as Record<string, unknown>
   const http = value.http as { status?: unknown; headers?: unknown } | undefined
   const rateLimit = value.rateLimit as Record<string, unknown> | undefined
+  const headers = http?.headers as Record<string, unknown> | undefined
+  const quotaHeaders = headers
+    ? Object.fromEntries(
+        Object.entries(headers).filter(([name]) => /^(?:x-)?ratelimit-|^retry-after(?:-|$)/i.test(name)),
+      )
+    : undefined
   const retryAfterMs = typeof value.retryAfterMs === "number" ? value.retryAfterMs : undefined
   const quota =
-    rateLimit || retryAfterMs !== undefined || (value._tag === "QuotaExceeded" && http?.headers)
-      ? { ...rateLimit, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}), headers: http?.headers }
+    rateLimit || retryAfterMs !== undefined || Object.keys(quotaHeaders ?? {}).length > 0
+      ? {
+          ...rateLimit,
+          ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+          ...(quotaHeaders ? { headers: quotaHeaders } : {}),
+        }
       : undefined
   return {
     error_tag: typeof value._tag === "string" ? value._tag : undefined,
     error_code: typeof value.code === "string" ? value.code : undefined,
     error_status: typeof http?.status === "number" ? http.status : undefined,
     error_message: typeof value.message === "string" ? value.message : undefined,
-    error_body: typeof value.body === "string" ? value.body : undefined,
     quota,
   }
 }

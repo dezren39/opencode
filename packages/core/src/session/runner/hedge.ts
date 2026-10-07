@@ -18,7 +18,7 @@ const OUTPUT = new Set<LLMEvent["type"]>([
 
 export const isOutput = (event: LLMEvent) => OUTPUT.has(event.type)
 
-type Settled = "output" | "failed"
+type Settled = { readonly status: "output" | "failed"; readonly at: number }
 
 interface Leg {
   /** Everything the leg has produced, buffered, then whatever it produces next. */
@@ -40,15 +40,23 @@ const startLeg = (source: Stream.Stream<LLMEvent, AIError>): Effect.Effect<Leg, 
           if (output) return Effect.void
           if (isOutput(event)) {
             output = true
-            return Deferred.succeed(settled, "output").pipe(Effect.asVoid)
+            return Deferred.succeed(settled, { status: "output" as const, at: performance.now() }).pipe(Effect.asVoid)
           }
-          if (LLMEvent.is.providerError(event)) return Deferred.succeed(settled, "failed").pipe(Effect.asVoid)
+          if (LLMEvent.is.providerError(event))
+            return Deferred.succeed(settled, { status: "failed" as const, at: performance.now() }).pipe(Effect.asVoid)
           return Effect.void
         }),
       ),
       Effect.exit,
       Effect.flatMap((exit) => (Exit.isSuccess(exit) ? Queue.end(queue) : Queue.failCause(queue, exit.cause))),
-      Effect.andThen(Effect.suspend(() => Deferred.succeed(settled, output ? "output" : "failed"))),
+      Effect.andThen(
+        Effect.suspend(() =>
+          Deferred.succeed(settled, {
+            status: output ? ("output" as const) : ("failed" as const),
+            at: performance.now(),
+          }),
+        ),
+      ),
       Effect.asVoid,
       Effect.forkScoped,
     )
@@ -73,6 +81,10 @@ export interface Result<T> {
   readonly startedAt: number
   /** How long the primary had been running when the hedge started. */
   readonly primaryElapsedMs: number
+  /** How long the losing request ran before it was cancelled. */
+  readonly loserElapsedMs: number
+  /** Set if a valid output event selected a winner. */
+  readonly outputAt?: number
 }
 
 /**
@@ -91,11 +103,12 @@ export const race = <T>(input: {
   Effect.gen(function* () {
     const began = performance.now()
     const a = yield* startLeg(input.primary)
+    const beforeHedge = Math.min(input.afterMs, input.deadlineMs)
     const early = yield* Effect.raceFirst(
-      Deferred.await(a.settled).pipe(Effect.as(true)),
-      Effect.sleep(input.afterMs).pipe(Effect.as(false)),
+      Deferred.await(a.settled).pipe(Effect.map((settled) => ({ kind: "settled" as const, settled }))),
+      Effect.sleep(beforeHedge).pipe(Effect.as({ kind: "delay" as const })),
     )
-    const alone = (): Result<T> => ({
+    const alone = (settled?: Settled): Result<T> => ({
       winner: "primary",
       value: undefined,
       hedgeValue: undefined,
@@ -103,16 +116,20 @@ export const race = <T>(input: {
       hedgeStarted: false,
       startedAt: began,
       primaryElapsedMs: performance.now() - began,
+      loserElapsedMs: 0,
+      ...(settled?.status === "output" ? { outputAt: settled.at } : {}),
     })
-    if (early) return alone()
+    if (early.kind === "settled") return alone(early.settled)
+    if (performance.now() - began >= input.deadlineMs) return alone()
     const hedge = yield* input.start
     if (Option.isNone(hedge)) return alone()
     const hedgeBegan = performance.now()
     const b = yield* startLeg(hedge.value.stream)
-    const remaining = () => Math.max(1_000, input.deadlineMs - (performance.now() - began))
+    const remaining = () => Math.max(0, input.deadlineMs - (performance.now() - began))
 
-    const decide = (winner: "a" | "b"): Effect.Effect<Result<T>> => {
+    const decide = (winner: "a" | "b", settled?: Settled): Effect.Effect<Result<T>> => {
       const loser = winner === "a" ? b : a
+      const now = performance.now()
       return Fiber.interrupt(loser.fiber).pipe(
         Effect.as<Result<T>>(
           winner === "a"
@@ -124,6 +141,8 @@ export const race = <T>(input: {
                 hedgeStarted: true,
                 startedAt: began,
                 primaryElapsedMs: hedgeBegan - began,
+                loserElapsedMs: now - hedgeBegan,
+                ...(settled?.status === "output" ? { outputAt: settled.at } : {}),
               }
             : {
                 winner: "hedge",
@@ -133,6 +152,8 @@ export const race = <T>(input: {
                 hedgeStarted: true,
                 startedAt: hedgeBegan,
                 primaryElapsedMs: hedgeBegan - began,
+                loserElapsedMs: now - began,
+                ...(settled?.status === "output" ? { outputAt: settled.at } : {}),
               },
         ),
       )
@@ -146,13 +167,13 @@ export const race = <T>(input: {
       ),
     )
     if (first.leg === "timeout") return yield* decide("a")
-    if (first.settled === "output") return yield* decide(first.leg)
+    if (first.settled.status === "output") return yield* decide(first.leg, first.settled)
     // One side failed before answering: the other still gets its chance until the deadline.
     const other = first.leg === "a" ? b : a
     const rest = yield* Effect.raceFirst(
       Deferred.await(other.settled),
       Effect.sleep(remaining()).pipe(Effect.as("failed" as const)),
     )
-    if (rest === "output") return yield* decide(first.leg === "a" ? "b" : "a")
+    if (typeof rest === "object" && rest.status === "output") return yield* decide(first.leg === "a" ? "b" : "a", rest)
     return yield* decide("a")
   })

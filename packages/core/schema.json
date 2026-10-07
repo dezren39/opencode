@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "cf1be9da-a2f2-43ea-ba03-8e994887126a",
-  "prevIds": ["e98619ef-c334-45e3-8c48-9932ed1ef290"],
+  "id": "697a5a2b-324c-43f9-beec-97eee70d1f08",
+  "prevIds": ["cf1be9da-a2f2-43ea-ba03-8e994887126a"],
   "ddl": [
     {
       "name": "account_state",
@@ -723,6 +723,16 @@
       "default": null,
       "generated": null,
       "name": "tokens_input",
+      "entityType": "columns",
+      "table": "route_attempt"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "tokens_estimated",
       "entityType": "columns",
       "table": "route_attempt"
     },

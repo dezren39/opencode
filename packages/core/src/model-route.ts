@@ -30,6 +30,8 @@ const Mode = Schema.Literals(["ordered", "round-robin", "weighted"])
 /** A group of targets with its own selection mode. Children are leaf target indexes or nested
  * groups; `weights` is parallel to `children`. Group 0 is the route itself. */
 const Node = Schema.Struct({
+  /** Route id at this point in the hierarchy. */
+  routeID: Schema.String.pipe(optional),
   selection: Mode,
   weights: Schema.Array(Schema.Finite.check(Schema.isGreaterThan(0))),
   children: Schema.Array(Schema.Struct({ leaf: Schema.Finite.pipe(optional), node: Schema.Finite.pipe(optional) })),
@@ -146,7 +148,7 @@ const recover = (target: Model.Ref, state: { samples: boolean[]; cooldownUntil: 
 const NETWORK_WINDOW_MS = 30_000
 const NETWORK_PROVIDERS = 3
 const PROVIDER_MODELS = 2
-const recentFailures: Array<{ readonly provider: string; readonly time: number }> = []
+const recentFailures: Array<{ readonly provider: string; readonly target: string; readonly time: number }> = []
 
 /** True when failures hit many unrelated providers within a short window. */
 export const networkSuspect = (now = Date.now()) =>
@@ -181,14 +183,26 @@ const MAX_COOLDOWN_MS = 86_400_000
 export interface FailureHint {
   readonly retryAfterMs?: number
   readonly quota?: boolean
+  /** A local transport failure with no provider HTTP response. */
+  readonly network?: boolean
 }
 
 export const failed = (target: Model.Ref, policy: Policy, now = Date.now(), hint?: FailureHint) => {
-  recentFailures.push({ provider: target.providerID, time: now })
+  // Quota, rate-limit and provider HTTP errors are not evidence of an internet outage.
+  if (hint?.network) recentFailures.push({ provider: target.providerID, target: key(target), time: now })
   while (recentFailures.length > 200 || (recentFailures[0] && now - recentFailures[0].time > NETWORK_WINDOW_MS))
     recentFailures.shift()
-  if (networkSuspect(now)) {
-    logHealth(target, "network-suspect", "failures across unrelated providers; target not cooled")
+  if (hint?.network && networkSuspect(now)) {
+    // Undo the cooldowns from the earlier correlated transport errors too: those requests likely
+    // shared the same local outage, so treating each provider as independently unhealthy is wrong.
+    for (const failure of recentFailures) {
+      const prior = health.get(failure.target)
+      if (prior && prior.cooldownUntil > now) {
+        prior.cooldownUntil = 0
+        prior.samples = []
+      }
+    }
+    logHealth(target, "network-suspect", "transport failures across unrelated providers; target cooldowns cleared")
     return
   }
   const state = entry(target)
@@ -255,13 +269,13 @@ export const resetHealth = () => {
 
 /** Per-route selection state: rotation counters for round-robin, sticky session choices, both
  * process-local like health. */
-const selection = new Map<string, { cursor: number; sessions: Map<string, number> }>()
+const selection = new Map<string, { cursor: number; sessions: Map<string, number>; scores: Map<number, number> }>()
 const SESSION_LIMIT = 5_000
 
 const selectionEntry = (routeID: string) => {
   let current = selection.get(routeID)
   if (!current) {
-    current = { cursor: 0, sessions: new Map() }
+    current = { cursor: 0, sessions: new Map(), scores: new Map() }
     selection.set(routeID, current)
   }
   return current
@@ -286,22 +300,35 @@ export const selectSessionTarget = (
   mode: "ordered" | "round-robin" | "weighted",
   candidateIndexes: readonly number[],
   weights: readonly number[],
+  random: () => number = Math.random,
 ): number | undefined => {
   if (candidateIndexes.length === 0) return undefined
   const first = candidateIndexes[0]
-  if (mode === "ordered" || candidateIndexes.length === 1) return first
+  if (mode === "ordered") return first
   const state = selectionEntry(routeID)
   const sticky = state.sessions.get(sessionID)
   if (sticky !== undefined && candidateIndexes.includes(sticky)) return sticky
   let chosen: number
   if (mode === "round-robin") {
-    const positions = candidateIndexes.map((index, position) => [position, index] as const)
-    const at = state.cursor % candidateIndexes.length
-    chosen = positions[at][1]
+    // Smooth weighted round robin. Equal weights are ordinary round robin; weights and
+    // user-supplied preference factors become stable ratios without random session-to-session
+    // variance.
+    const total = candidateIndexes.reduce((sum, index) => sum + (weights[index] ?? 1), 0)
+    chosen = candidateIndexes[0]
+    let greatest = Number.NEGATIVE_INFINITY
+    for (const index of candidateIndexes) {
+      const score = (state.scores.get(index) ?? 0) + (weights[index] ?? 1)
+      state.scores.set(index, score)
+      if (score > greatest) {
+        greatest = score
+        chosen = index
+      }
+    }
+    state.scores.set(chosen, (state.scores.get(chosen) ?? 0) - total)
     state.cursor = (state.cursor + 1) % Number.MAX_SAFE_INTEGER
   } else {
     const total = candidateIndexes.reduce((sum, index) => sum + (weights[index] ?? 1), 0)
-    let draw = Math.random() * total
+    let draw = random() * total
     chosen = candidateIndexes[candidateIndexes.length - 1]
     for (const index of candidateIndexes) {
       draw -= weights[index] ?? 1
@@ -475,59 +502,154 @@ export const weightFactor = (target: Model.Ref, now = Date.now()) =>
     .filter((item) => item.action === "weight" && matches(item, target))
     .reduce((product, item) => product * (item.factor ?? 1), 1)
 
-/** Walks the group tree into an ordered list of leaf target indexes. Each group puts its chosen
- * child first (sticky per session, drawn only when `draw` is set) and keeps the rest in config
- * order, so failover walks siblings before leaving the group's parent. Groups with no ready leaf
- * drop out and their weight is redistributed. */
+/** Chooses one leaf lazily. Only groups on the chosen path draw their sticky/rotation entry; nested
+ * siblings aren't consumed until failover reaches them. This makes RR and weights compositional. */
+export const nextTarget = (
+  definition: Definition,
+  ready: ReadonlySet<number>,
+  tried: ReadonlySet<number>,
+  sessionID: string | undefined,
+  draw: boolean,
+  variant?: string,
+  unavailable?: ReadonlyMap<number, string>,
+  random: () => number = Math.random,
+): number | undefined => {
+  const hasReady = (nodeIndex: number): boolean => {
+    const node = definition.nodes[nodeIndex]
+    if (!node) return false
+    return node.children.some((child) =>
+      child.leaf !== undefined
+        ? ready.has(child.leaf) && !tried.has(child.leaf)
+        : child.node !== undefined && hasReady(child.node),
+    )
+  }
+  const leaves = (nodeIndex: number): number[] => {
+    const node = definition.nodes[nodeIndex]
+    if (!node) return []
+    return node.children.flatMap((child) =>
+      child.leaf !== undefined ? [child.leaf] : child.node !== undefined ? leaves(child.node) : [],
+    )
+  }
+  const factor = (nodeIndex: number) => {
+    const eligible = leaves(nodeIndex).filter((index) => ready.has(index) && !tried.has(index))
+    return eligible.length === 0
+      ? 1
+      : eligible.reduce((sum, index) => sum + weightFactor(definition.targets[index]), 0) / eligible.length
+  }
+  const label = (child: Node["children"][number]) =>
+    child.leaf !== undefined
+      ? `${definition.targets[child.leaf]?.providerID}/${definition.targets[child.leaf]?.id}`
+      : child.node !== undefined
+        ? `opencode-route/${definition.nodes[child.node]?.routeID ?? child.node}`
+        : "unknown"
+  const walk = (nodeIndex: number): number | undefined => {
+    const node = definition.nodes[nodeIndex]
+    if (!node) return undefined
+    const positions = node.children.flatMap((child, position) => {
+      const available =
+        child.leaf !== undefined
+          ? ready.has(child.leaf) && !tried.has(child.leaf)
+          : child.node !== undefined && hasReady(child.node)
+      return available ? [position] : []
+    })
+    if (positions.length === 0) {
+      ModelRouteLog.record({
+        kind: "decision",
+        row: {
+          time: Date.now(),
+          session_id: sessionID,
+          route_id: node.routeID ?? definition.id,
+          selection: node.selection,
+          variant,
+          candidates: [],
+          reason: "no-candidates",
+        },
+      })
+      return undefined
+    }
+    const factors = node.children.map((child) =>
+      child.leaf !== undefined
+        ? weightFactor(definition.targets[child.leaf])
+        : child.node !== undefined
+          ? factor(child.node)
+          : 1,
+    )
+    const selectionKey = `${node.routeID ?? definition.id}#${nodeIndex}`
+    const priorSticky = sessionID ? sessionTarget(selectionKey, sessionID) : undefined
+    let ordered = positions
+    let decisionReason = "ordered"
+    if (node.selection === "ordered" && positions.some((position) => factors[position] !== 1)) {
+      ordered = positions.toSorted((left, right) => factors[right] - factors[left])
+      decisionReason = "adjusted"
+    } else if (sessionID && sessionScoped(node.selection)) {
+      const chosen =
+        priorSticky !== undefined && positions.includes(priorSticky)
+          ? priorSticky
+          : draw
+            ? selectSessionTarget(
+                selectionKey,
+                sessionID,
+                node.selection,
+                positions,
+                node.children.map((_, position) => (node.weights[position] ?? 1) * (factors[position] ?? 1)),
+                random,
+              )
+            : undefined
+      if (chosen !== undefined) ordered = [chosen, ...positions.filter((position) => position !== chosen)]
+      decisionReason =
+        priorSticky !== undefined && positions.includes(priorSticky) ? "sticky" : draw ? "drawn" : "ordered"
+    }
+    const chosen = ordered[0]
+    const excluded = node.children.flatMap((child, position) => {
+      const childLeaves = child.leaf !== undefined ? [child.leaf] : child.node !== undefined ? leaves(child.node) : []
+      return childLeaves.flatMap((index) => {
+        const unavailableReason = unavailable?.get(index) ?? (tried.has(index) ? "already-tried" : undefined)
+        return unavailableReason ? [{ candidate: label(node.children[position]), reason: unavailableReason }] : []
+      })
+    })
+    ModelRouteLog.record({
+      kind: "decision",
+      row: {
+        time: Date.now(),
+        session_id: sessionID,
+        route_id: node.routeID ?? definition.id,
+        selection: node.selection,
+        variant,
+        candidates: positions.map((position) => label(node.children[position])),
+        chosen: chosen === undefined ? undefined : label(node.children[chosen]),
+        reason: decisionReason,
+        detail: {
+          weights: Object.fromEntries(
+            positions.map((position) => [label(node.children[position]), node.weights[position] * factors[position]]),
+          ),
+          excluded,
+        },
+      },
+    })
+    const selected = chosen === undefined ? undefined : node.children[chosen]
+    if (!selected) return undefined
+    if (selected.leaf !== undefined) return selected.leaf
+    return selected.node === undefined ? undefined : walk(selected.node)
+  }
+  return walk(0)
+}
+
+/** Compatibility/test helper. Production resolution calls `nextTarget` lazily so unvisited sibling
+ * groups do not consume their own round-robin or weighted draw. */
 export const orderTargets = (
   definition: Definition,
   ready: ReadonlySet<number>,
   sessionID: string | undefined,
   draw: boolean,
-): number[] => {
-  const walk = (nodeIndex: number): number[][] => {
-    const node = definition.nodes[nodeIndex]
-    if (!node) return []
-    const groups = node.children.map((child) =>
-      child.leaf !== undefined
-        ? ready.has(child.leaf)
-          ? [child.leaf]
-          : []
-        : child.node !== undefined
-          ? walk(child.node).flat()
-          : [],
-    )
-    const positions = groups.flatMap((group, position) => (group.length > 0 ? [position] : []))
-    // A group's share scales with the average factor of its members, so "favor claude" lifts a
-    // route made mostly of claude targets.
-    const factors = groups.map((group) =>
-      group.length === 0
-        ? 1
-        : group.reduce((sum, leaf) => sum + weightFactor(definition.targets[leaf]), 0) / group.length,
-    )
-    let ordered = positions
-    if (node.selection === "ordered" && positions.some((position) => factors[position] !== 1)) {
-      ordered = positions.toSorted((left, right) => factors[right] - factors[left])
-    } else if (sessionID && sessionScoped(node.selection) && positions.length > 1) {
-      const key = `${definition.id}#${nodeIndex}`
-      const sticky = sessionTarget(key, sessionID)
-      const chosen =
-        sticky !== undefined && positions.includes(sticky)
-          ? sticky
-          : draw
-            ? selectSessionTarget(
-                key,
-                sessionID,
-                node.selection,
-                positions,
-                node.weights.map((weight, position) => weight * (factors[position] ?? 1)),
-              )
-            : undefined
-      if (chosen !== undefined) ordered = [chosen, ...positions.filter((position) => position !== chosen)]
-    }
-    return ordered.map((position) => groups[position])
+) => {
+  const tried = new Set<number>()
+  const result: number[] = []
+  while (true) {
+    const next = nextTarget(definition, ready, tried, sessionID, draw)
+    if (next === undefined) return result
+    tried.add(next)
+    result.push(next)
   }
-  return walk(0).flat()
 }
 
 /** Drops a session's sticky choice, e.g. when its model selection leaves the route. Test seam. */

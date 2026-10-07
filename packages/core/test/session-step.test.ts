@@ -346,6 +346,7 @@ it.live("hedges to the next target when the first stays silent, and the faster a
         },
         retry: (_cause, _error, retry) =>
           Effect.succeed(retry ? { retry: true, attempt: 1, delay: 0 } : { retry: false }),
+        estimatedInputTokens: 1_234,
         prepareFor: (next) =>
           Effect.succeed({
             retry: () => Effect.void,
@@ -366,6 +367,8 @@ it.live("hedges to the next target when the first stays silent, and the faster a
     // The slow primary is counted as slow but not cooled by a single miss.
     expect(ModelRoute.coolingDown(primary.ref)).toBe(false)
     expect(fallbackCalls).toBe(1)
+    // The cancelled primary still cost a request, charged at the prompt-size estimate.
+    expect(ModelRoute.usageOf(primary.ref).day).toEqual({ requests: 1, tokens: 1_234 })
   }),
 )
 

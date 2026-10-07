@@ -148,10 +148,12 @@ function expand(
     const nextTrail = new Set(trail).add(routeID)
     const nodeIndex = nodes.length
     const node: {
+      routeID: string
       selection: ModelRoute.Node["selection"]
       weights: number[]
       children: ModelRoute.Node["children"][number][]
     } = {
+      routeID,
       selection: current.selection ?? "ordered",
       weights: [],
       children: [],
