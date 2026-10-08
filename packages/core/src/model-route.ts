@@ -4,6 +4,7 @@ import { Model } from "@opencode/schema/model"
 import { Provider } from "@opencode/schema/provider"
 import { Schema } from "effect"
 import { ModelRouteLimits } from "./model-route-limits.js"
+import { ModelRouteAutonomy } from "./model-route-autonomy.js"
 import { ModelRouteLog } from "./model-route-log.js"
 import { ModelRouteOverrides } from "./model-route-overrides.js"
 import { optional, PositiveInt } from "@opencode/schema/schema"
@@ -482,8 +483,13 @@ export const usageOf = (target: Model.Ref, now = Date.now()) => {
 }
 
 /** True when any allowance in `budget` is used up to its soft limit. */
-export const overBudget = (target: Model.Ref, budget: Budget | undefined, now = Date.now()) => {
-  if (!budget || userOverride("allow-over-budget", target, now)) return false
+export const overBudget = (
+  target: Model.Ref,
+  budget: Budget | undefined,
+  now = Date.now(),
+  scope: ModelRouteOverrides.Scope = {},
+) => {
+  if (!budget || userOverride("allow-over-budget", target, now, scope)) return false
   const soft = budget.softLimit ?? 0.9
   const used = usageOf(target, now)
   const over = (value: number, limit: number | undefined) => limit !== undefined && value >= limit * soft
@@ -619,25 +625,52 @@ export const activeAdjustments = (now = Date.now()) => adjustments.filter((item)
 const matches = (item: Adjustment, target: Model.Ref) =>
   `${target.providerID}/${target.id}`.toLowerCase().includes(item.match.toLowerCase())
 
-const userOverride = (action: ModelRouteOverrides.Action, target: Model.Ref, now: number) =>
-  ModelRouteOverrides.current().some((item) => item.action === action && ModelRouteOverrides.applies(item, target, now))
+const userOverrides = (
+  action: ModelRouteOverrides.Action,
+  target: Model.Ref,
+  now: number,
+  scope: ModelRouteOverrides.Scope,
+) =>
+  ModelRouteOverrides.current().filter(
+    (item) => item.action === action && ModelRouteOverrides.applies(item, target, now, scope),
+  )
 
+const userOverride = (
+  action: ModelRouteOverrides.Action,
+  target: Model.Ref,
+  now: number,
+  scope: ModelRouteOverrides.Scope,
+) => userOverrides(action, target, now, scope).length > 0
+
+/** A target the user has said to avoid, on this route. Applies at every autonomy level. */
+export const userSkipped = (target: Model.Ref, now = Date.now(), scope: ModelRouteOverrides.Scope = {}) =>
+  userOverride("avoid", target, now, scope)
+
+/** A target the route's learned adjustments skip. Only routes that let the tuner decide see these. */
 export const skipped = (target: Model.Ref, now = Date.now()) =>
-  userOverride("avoid", target, now) ||
   activeAdjustments(now).some((item) => item.action === "skip" && matches(item, target))
 
-/** Combined weight factor for a target; 1 when nothing applies. */
+/** Weight multiplier for a target demoted by quota errors. */
 const DEMOTED_FACTOR = 0.01
 
-/** How much a user's "prefer" lifts a target. Strong enough to beat an ordinary weight, not a demotion. */
+/** How much a user's "prefer" lifts a target when they don't say by how much. */
 const PREFERRED_FACTOR = 3
 
-export const weightFactor = (target: Model.Ref, now = Date.now()) =>
-  activeAdjustments(now)
-    .filter((item) => item.action === "weight" && matches(item, target))
-    .reduce((product, item) => product * (item.factor ?? 1), 1) *
-  (userOverride("prefer", target, now) ? PREFERRED_FACTOR : 1) *
-  (demoted(target, now) ? DEMOTED_FACTOR : 1)
+/** The weight a target carries on a route. The user's own priorities apply on every route; learned
+ * weights apply only where the tuner is allowed to decide, so a `fixed` route keeps its order. */
+export const weightFactor = (target: Model.Ref, now = Date.now(), scope: ModelRouteOverrides.Scope = {}) => {
+  const preferred = userOverrides("prefer", target, now, scope).reduce(
+    (product, item) => product * (item.factor ?? PREFERRED_FACTOR),
+    1,
+  )
+  const learned =
+    scope.fixed === true
+      ? 1
+      : activeAdjustments(now)
+          .filter((item) => item.action === "weight" && matches(item, target))
+          .reduce((product, item) => product * (item.factor ?? 1), 1)
+  return preferred * learned * (demoted(target, now) ? DEMOTED_FACTOR : 1)
+}
 
 /** A session already answered by this target keeps it through a burst rate-limit hold, as long as the
  * target is still working and not demoted. New sessions go elsewhere; current ones stay where their
@@ -647,6 +680,12 @@ export const keepsThrough = (routeID: string, sessionID: string | undefined, tar
   continuityOf(routeID, sessionID)?.current === key(target) &&
   steady(target) &&
   !demoted(target, now)
+
+/** The scope overrides and weights are judged against: this route, and whether it is `fixed`. */
+export const scopeOf = (definition: Definition): ModelRouteOverrides.Scope => ({
+  routeID: definition.id,
+  fixed: !ModelRouteAutonomy.usesRules(definition.autonomy),
+})
 
 /** Chooses one leaf lazily. Only groups on the chosen path draw their sticky/rotation entry; nested
  * siblings aren't consumed until failover reaches them. This makes RR and weights compositional. */
@@ -680,7 +719,10 @@ export const nextTarget = (
     const eligible = leaves(nodeIndex).filter((index) => ready.has(index) && !tried.has(index))
     return eligible.length === 0
       ? 1
-      : eligible.reduce((sum, index) => sum + weightFactor(definition.targets[index]), 0) / eligible.length
+      : eligible.reduce(
+          (sum, index) => sum + weightFactor(definition.targets[index], Date.now(), scopeOf(definition)),
+          0,
+        ) / eligible.length
   }
   const label = (child: Node["children"][number]) =>
     child.leaf !== undefined
@@ -715,7 +757,7 @@ export const nextTarget = (
     }
     const factors = node.children.map((child) =>
       child.leaf !== undefined
-        ? weightFactor(definition.targets[child.leaf])
+        ? weightFactor(definition.targets[child.leaf], Date.now(), scopeOf(definition))
         : child.node !== undefined
           ? factor(child.node)
           : 1,

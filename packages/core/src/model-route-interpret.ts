@@ -1,12 +1,16 @@
 export * as ModelRouteInterpret from "./model-route-interpret.js"
 
-import type { Action } from "./model-route-overrides.js"
+import type { Action, Override } from "./model-route-overrides.js"
 
 /** What a sentence means, before it is stored. Ids and sources are assigned when it is applied. */
 export interface Draft {
   readonly action: Action
   readonly providers: readonly string[]
   readonly models: readonly string[]
+  /** For `prefer`: how strongly. Above 1 raises priority, below 1 makes the target lighter. */
+  readonly factor?: number
+  /** Whether the draft reaches routes set to `fixed`. */
+  readonly fixed?: boolean
   readonly until: number
   readonly text: string
 }
@@ -60,6 +64,16 @@ const AVOID =
 const PREFER = /\b(prefer|favou?r|use only|only use|switch to|stick to|use|go with)\b/
 const BUDGET = /\b(credits?|budget|spend|burn|unlimited|ignore (?:the )?(?:budget|limit)s?|no limit)\b/
 const POOLS = /\b(include|add)\b.*\bpools?\b/
+/** "use opus less", "lighter on sonnet": lowers priority rather than raising it. */
+const LIGHTER = /\b(less|lighter|fewer|rarely|go easy on|lower priority|deprioritize|deprioritise)\b/
+/** "except on fixed routes", "not fixed": the user's word stops short of routes set to fixed. */
+const NOT_FIXED = /\b(except|excluding|apart from|but not|not on|not)\b[^.]{0,24}\bfixed\b/
+/** Priority in a sentence: a stated factor such as "3x" can override the default. */
+const priorityOf = (text: string, lighter: boolean) => {
+  const stated = /\b(\d+(?:\.\d+)?)\s*x\b/.exec(text)
+  if (stated && Number(stated[1]) > 0) return lighter ? 1 / Number(stated[1]) : Number(stated[1])
+  return lighter ? 1 / 3 : 3
+}
 
 /** When the override ends: the end of today, a week, or a stated duration. Without one, a day, and
  * the result says so, so the user can correct it. */
@@ -143,14 +157,23 @@ export const keywords = (input: string, context: Context): Result => {
   const families = FAMILIES.filter((family) => has(text, family))
   const claude = has(text, "claude")
   const action = actions[0]
+  const lighter = LIGHTER.test(text)
+  const fixed = !NOT_FIXED.test(text)
+  const draftFor = (item: Action, scope: Pick<Draft, "providers" | "models">): Draft => ({
+    action: item,
+    ...scope,
+    ...(item === "prefer" ? { factor: priorityOf(text, lighter) } : {}),
+    fixed,
+    until,
+    text: input,
+  })
 
   if (families.length === 0 && providers.length === 0 && !claude)
     return { status: "unknown", stage, reason: "No provider or model was named." }
 
   // "claude" alone may mean the Anthropic provider or every Claude model on any provider.
   if (claude && providers.length === 0 && families.length === 0) {
-    const drafts = (scope: Pick<Draft, "providers" | "models">) =>
-      actions.map((item) => ({ action: item, ...scope, until, text: input }))
+    const drafts = (scope: Pick<Draft, "providers" | "models">) => actions.map((item) => draftFor(item, scope))
     return {
       status: "clarify",
       stage,
@@ -166,8 +189,7 @@ export const keywords = (input: string, context: Context): Result => {
     const family = families[0]
     // Excluding a family is the riskier reading, so it is confirmed before it is applied.
     if (action === "avoid") {
-      const drafts = (scope: Pick<Draft, "providers" | "models">) =>
-        actions.map((item) => ({ action: item, ...scope, until, text: input }))
+      const drafts = (scope: Pick<Draft, "providers" | "models">) => actions.map((item) => draftFor(item, scope))
       return {
         status: "clarify",
         stage,
@@ -186,7 +208,7 @@ export const keywords = (input: string, context: Context): Result => {
     const scopes = latest.length
       ? latest.map((model) => ({ providers: [model.providerID], models: [model.id] }))
       : [{ providers: [], models: [`*${family}*`] }]
-    const drafts = scopes.flatMap((scope) => actions.map((item) => ({ action: item, ...scope, until, text: input })))
+    const drafts = scopes.flatMap((scope) => actions.map((item) => draftFor(item, scope)))
     return {
       status: "decided",
       stage,
@@ -197,7 +219,7 @@ export const keywords = (input: string, context: Context): Result => {
   }
 
   const models = families.map((family) => `*${family}*`)
-  const drafts = actions.map((item) => ({ action: item, providers, models, until, text: input }))
+  const drafts = actions.map((item) => draftFor(item, { providers, models }))
   return {
     status: "decided",
     stage,
@@ -234,3 +256,19 @@ export const interpret = async (
   }
   return best ?? { status: "unknown", stage: "none", reason: "Could not tell what to change from that." }
 }
+
+/** Turns the drafts a user accepted into stored overrides, each with its own id so one can be removed. */
+export const toOverrides = (drafts: readonly Draft[], source: "user" | "interpreter", now: number): Override[] =>
+  drafts.map((draft, index) => ({
+    id: `${source}:${now}:${index}:${draft.action}`,
+    action: draft.action,
+    providers: draft.providers,
+    models: draft.models,
+    routes: [],
+    fixed: draft.fixed !== false,
+    ...(draft.factor !== undefined ? { factor: draft.factor } : {}),
+    until: draft.until,
+    text: draft.text,
+    source,
+    createdAt: now,
+  }))
