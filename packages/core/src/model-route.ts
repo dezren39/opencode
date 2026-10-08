@@ -5,6 +5,7 @@ import { Provider } from "@opencode/schema/provider"
 import { Schema } from "effect"
 import { ModelRouteLimits } from "./model-route-limits.js"
 import { ModelRouteLog } from "./model-route-log.js"
+import { ModelRouteOverrides } from "./model-route-overrides.js"
 import { optional, PositiveInt } from "@opencode/schema/schema"
 
 export const PROVIDER_ID = Provider.ID.make("opencode-route")
@@ -482,7 +483,7 @@ export const usageOf = (target: Model.Ref, now = Date.now()) => {
 
 /** True when any allowance in `budget` is used up to its soft limit. */
 export const overBudget = (target: Model.Ref, budget: Budget | undefined, now = Date.now()) => {
-  if (!budget) return false
+  if (!budget || userOverride("allow-over-budget", target, now)) return false
   const soft = budget.softLimit ?? 0.9
   const used = usageOf(target, now)
   const over = (value: number, limit: number | undefined) => limit !== undefined && value >= limit * soft
@@ -618,16 +619,25 @@ export const activeAdjustments = (now = Date.now()) => adjustments.filter((item)
 const matches = (item: Adjustment, target: Model.Ref) =>
   `${target.providerID}/${target.id}`.toLowerCase().includes(item.match.toLowerCase())
 
+const userOverride = (action: ModelRouteOverrides.Action, target: Model.Ref, now: number) =>
+  ModelRouteOverrides.current().some((item) => item.action === action && ModelRouteOverrides.applies(item, target, now))
+
 export const skipped = (target: Model.Ref, now = Date.now()) =>
+  userOverride("avoid", target, now) ||
   activeAdjustments(now).some((item) => item.action === "skip" && matches(item, target))
 
 /** Combined weight factor for a target; 1 when nothing applies. */
 const DEMOTED_FACTOR = 0.01
 
+/** How much a user's "prefer" lifts a target. Strong enough to beat an ordinary weight, not a demotion. */
+const PREFERRED_FACTOR = 3
+
 export const weightFactor = (target: Model.Ref, now = Date.now()) =>
   activeAdjustments(now)
     .filter((item) => item.action === "weight" && matches(item, target))
-    .reduce((product, item) => product * (item.factor ?? 1), 1) * (demoted(target, now) ? DEMOTED_FACTOR : 1)
+    .reduce((product, item) => product * (item.factor ?? 1), 1) *
+  (userOverride("prefer", target, now) ? PREFERRED_FACTOR : 1) *
+  (demoted(target, now) ? DEMOTED_FACTOR : 1)
 
 /** A session already answered by this target keeps it through a burst rate-limit hold, as long as the
  * target is still working and not demoted. New sessions go elsewhere; current ones stay where their
