@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test"
+import path from "node:path"
 import { Effect } from "effect"
 import { ShellParse } from "../../src/shell/parse.js"
 import { ShellScan } from "../../src/shell/scan.js"
+
+// The probes call `cat`, which lives in /run/current-system/sw/bin on NixOS, not /bin.
+const toolPath = path.dirname(Bun.which("cat") ?? "/usr/bin/cat")
 
 const fixtures = [
   ["if true; then VALUE=$(scan_probe); fi", ["true", "scan_probe"]],
@@ -113,7 +117,7 @@ describe("ordinary Bash and Zsh syntax", () => {
           "-c",
           `scan_probe() { printf 'scan_probe\\n' >&2; printf 1; }; scan_ignored() { printf 'unexpected\\n' >&2; }; ${source}`,
         ],
-        { env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } },
+        { env: { PATH: toolPath, LC_ALL: "C" } },
       )
       expect(execution.exitCode).toBe(0)
       expect(execution.stderr.toString()).toBe("scan_probe\n")
@@ -232,7 +236,7 @@ describe("Bash shared heredoc delimiter grammar", () => {
     ])("real Bash agrees with delimiter quoting: %s", (source) => {
     const execution = Bun.spawnSync(
       [bash!, "--noprofile", "--norc", "-c", `scan_probe() { printf 'executed\\n' >&2; }; ${source}`],
-      { env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } },
+      { env: { PATH: toolPath, LC_ALL: "C" } },
     )
     expect(execution.exitCode).toBe(0)
     expect(execution.stderr.toString()).toBe(source.includes("<<EO\\\nF") ? "executed\n" : "")
