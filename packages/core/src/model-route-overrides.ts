@@ -16,6 +16,12 @@ export interface Override {
   /** Model ID patterns where `*` matches any run of characters. Empty means every model of the
    * named providers; `*` on its own is the explicit "every model" choice. */
   readonly models: readonly string[]
+  /** Route IDs the override is limited to. Empty means every route. */
+  readonly routes: readonly string[]
+  /** Whether it reaches routes set to `fixed`. On by default: a user's word outranks the route's level. */
+  readonly fixed: boolean
+  /** For `prefer`: the weight multiplier. Above 1 favours the target, below 1 makes it lighter. */
+  readonly factor?: number
   readonly until: number
   readonly text: string
   readonly source: "user" | "interpreter"
@@ -44,6 +50,11 @@ export const parse = (value: unknown): Override[] => {
     const providers = strings(field(item, "providers"))
     const models = strings(field(item, "models"))
     if (providers.length === 0 && models.length === 0) return []
+    const routes = strings(field(item, "routes"))
+    const fixed = field(item, "fixed") !== false
+    const factorValue = field(item, "factor")
+    const factor =
+      typeof factorValue === "number" && Number.isFinite(factorValue) && factorValue > 0 ? factorValue : undefined
     const text = field(item, "text")
     const source = field(item, "source")
     const createdAt = field(item, "createdAt")
@@ -53,6 +64,9 @@ export const parse = (value: unknown): Override[] => {
         action: action as Action,
         providers,
         models,
+        routes,
+        fixed,
+        ...(factor !== undefined ? { factor } : {}),
         until,
         text: typeof text === "string" ? text : "",
         source: source === "interpreter" ? "interpreter" : "user",
@@ -66,11 +80,25 @@ const escape = (text: string) => text.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
 
 const glob = (pattern: string) => new RegExp(`^${pattern.split("*").map(escape).join(".*")}$`, "i")
 
-/** Whether an override is in force for a target at `now`. */
-export const applies = (item: Override, target: { readonly providerID: string; readonly id: string }, now: number) =>
+/** The route a request is being chosen for, and whether that route is set to `fixed`. Without a scope
+ * an override applies to every route, as it did before routes had levels. */
+export interface Scope {
+  readonly routeID?: string
+  readonly fixed?: boolean
+}
+
+/** Whether an override is in force for a target at `now`, on a given route. */
+export const applies = (
+  item: Override,
+  target: { readonly providerID: string; readonly id: string },
+  now: number,
+  scope: Scope = {},
+) =>
   now < item.until &&
   (item.providers.length === 0 || item.providers.some((id) => id.toLowerCase() === target.providerID.toLowerCase())) &&
-  (item.models.length === 0 || item.models.some((pattern) => glob(pattern).test(target.id)))
+  (item.models.length === 0 || item.models.some((pattern) => glob(pattern).test(target.id))) &&
+  (item.routes.length === 0 || scope.routeID === undefined || item.routes.includes(scope.routeID)) &&
+  (item.fixed || scope.fixed !== true)
 
 let location: string | undefined
 let cache: { file: string; mtime: number; list: readonly Override[] } | undefined

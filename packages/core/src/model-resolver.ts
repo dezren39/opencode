@@ -449,8 +449,10 @@ export const layer = Layer.effect(
             const until = ModelRoute.cooldownUntil(target, now)
             // A fixed route only fails over: provider holds, skips and budgets are rules and above.
             const rules = ModelRouteAutonomy.usesRules(definition.autonomy)
-            const isSkipped = rules && ModelRoute.skipped(target, now)
-            const isOverBudget = rules && ModelRoute.overBudget(target, definition.budgets?.[index], now)
+            const scope = ModelRoute.scopeOf(definition)
+            // A user's "avoid" holds on every route; learned skips and budgets are rules the route opted into.
+            const isSkipped = ModelRoute.userSkipped(target, now, scope) || (rules && ModelRoute.skipped(target, now))
+            const isOverBudget = rules && ModelRoute.overBudget(target, definition.budgets?.[index], now, scope)
             const limited = rules ? ModelRoute.limitedUntil(target, now) : 0
             // A burst hold steers new sessions away but leaves a session on the target it is already using.
             const kept = limited > now && ModelRoute.keepsThrough(definition.id, sessionID, target, now)

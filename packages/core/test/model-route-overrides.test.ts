@@ -15,6 +15,8 @@ const draft = (over: Partial<ModelRouteOverrides.Override>): ModelRouteOverrides
   action: "avoid",
   providers: [],
   models: [],
+  routes: [],
+  fixed: true,
   until: now + DAY,
   text: "",
   source: "user",
@@ -86,9 +88,9 @@ describe("ModelRouteOverrides storage", () => {
 describe("user overrides in routing", () => {
   test("avoid takes a target out of rotation until it expires", () => {
     ModelRouteOverrides.add(draft({ providers: ["openai"] }), now)
-    expect(ModelRoute.skipped(openai, now)).toBe(true)
-    expect(ModelRoute.skipped(anthropic, now)).toBe(false)
-    expect(ModelRoute.skipped(openai, now + DAY + 1)).toBe(false)
+    expect(ModelRoute.userSkipped(openai, now)).toBe(true)
+    expect(ModelRoute.userSkipped(anthropic, now)).toBe(false)
+    expect(ModelRoute.userSkipped(openai, now + DAY + 1)).toBe(false)
   })
 
   test("prefer raises a target's weight", () => {
@@ -187,5 +189,91 @@ describe("interpreting a sentence", () => {
     })
     const result = await ModelRouteInterpret.interpret("stop using openai", context(), undefined, { external })
     expect(result).toMatchObject({ status: "decided", stage: "external" })
+  })
+})
+
+describe("priority, lighter, and the fixed-route facet", () => {
+  const sonnet = ModelRoute.ref({ providerID: "anthropic", model: "claude-sonnet-4" })
+  const fixedScope = { routeID: "r", fixed: true }
+  const rulesScope = { routeID: "r", fixed: false }
+
+  test("an avoid reaches fixed routes by default", () => {
+    ModelRouteOverrides.add(draft({ providers: ["openai"] }), now)
+    expect(ModelRoute.userSkipped(openai, now, fixedScope)).toBe(true)
+    expect(ModelRoute.userSkipped(openai, now, rulesScope)).toBe(true)
+  })
+
+  test("an override marked not-fixed stops short of fixed routes", () => {
+    ModelRouteOverrides.add(draft({ providers: ["openai"], fixed: false }), now)
+    expect(ModelRoute.userSkipped(openai, now, fixedScope)).toBe(false)
+    expect(ModelRoute.userSkipped(openai, now, rulesScope)).toBe(true)
+  })
+
+  test("an override limited to one route does not touch another", () => {
+    ModelRouteOverrides.add(draft({ providers: ["openai"], routes: ["other"] }), now)
+    expect(ModelRoute.userSkipped(openai, now, { routeID: "r", fixed: true })).toBe(false)
+    expect(ModelRoute.userSkipped(openai, now, { routeID: "other", fixed: true })).toBe(true)
+  })
+
+  test("prefer reorders a fixed route's order and raises a target's weight", () => {
+    ModelRoute.resetHealth()
+    const targets = [openai, sonnet]
+    const definition = {
+      id: "r",
+      targets,
+      targetVariants: [],
+      health: ModelRoute.policy(),
+      autonomy: "fixed",
+      nodes: [{ selection: "ordered" as const, weights: [1, 1], children: [{ leaf: 0 }, { leaf: 1 }] }],
+    } as unknown as ModelRoute.Definition
+    expect(ModelRoute.orderTargets(definition, new Set([0, 1]), undefined, false)).toEqual([0, 1])
+    ModelRouteOverrides.add(draft({ action: "prefer", providers: ["anthropic"] }), now)
+    expect(ModelRoute.orderTargets(definition, new Set([0, 1]), undefined, false)).toEqual([1, 0])
+  })
+
+  test("a lighter preference moves a target down and carries its own factor", () => {
+    ModelRouteOverrides.add(draft({ action: "prefer", providers: ["anthropic"], factor: 1 / 3 }), now)
+    expect(ModelRoute.weightFactor(sonnet, now, rulesScope)).toBeCloseTo(1 / 3)
+  })
+
+  test("learned weights do not reorder a fixed route, but do on a route that lets the tuner decide", () => {
+    ModelRoute.resetHealth()
+    ModelRoute.setAdjustments([
+      { id: "auto:w", match: "anthropic/claude-sonnet-4", action: "weight", factor: 5, until: now + DAY },
+    ])
+    expect(ModelRoute.weightFactor(sonnet, now, fixedScope)).toBe(1)
+    expect(ModelRoute.weightFactor(sonnet, now, rulesScope)).toBe(5)
+    ModelRoute.setAdjustments([])
+  })
+})
+
+describe("interpreting priority and facets", () => {
+  const context = { now, providers: ["anthropic", "openai"], models: [] }
+
+  test("'use opus less today' lowers priority rather than raising it", () => {
+    const result = ModelRouteInterpret.keywords("use anthropic opus less today", context)
+    if (result.status !== "decided") throw new Error("expected a decision")
+    expect(result.drafts[0]).toMatchObject({ action: "prefer", factor: 1 / 3 })
+  })
+
+  test("a stated multiple sets the factor", () => {
+    const result = ModelRouteInterpret.keywords("prefer openai 2x", context)
+    if (result.status !== "decided") throw new Error("expected a decision")
+    expect(result.drafts[0]).toMatchObject({ action: "prefer", factor: 2 })
+  })
+
+  test("'except on fixed routes' stops the override short of fixed routes", () => {
+    const result = ModelRouteInterpret.keywords("prefer anthropic except on fixed routes", context)
+    if (result.status !== "decided") throw new Error("expected a decision")
+    expect(result.drafts[0]).toMatchObject({ fixed: false })
+  })
+
+  test("drafts become stored overrides that keep their facets", () => {
+    const [override] = ModelRouteInterpret.toOverrides(
+      [{ action: "prefer", providers: ["openai"], models: [], factor: 3, fixed: false, until: now + DAY, text: "x" }],
+      "user",
+      now,
+    )
+    expect(override).toMatchObject({ action: "prefer", providers: ["openai"], factor: 3, fixed: false, source: "user" })
   })
 })
