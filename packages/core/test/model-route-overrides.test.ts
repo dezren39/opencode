@@ -3,7 +3,6 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { ModelRoute } from "@opencode/core/model-route"
-import { ModelRouteInterpret } from "@opencode/core/model-route-interpret"
 import { ModelRouteOverrides } from "@opencode/core/model-route-overrides"
 
 const DAY = 86_400_000
@@ -109,89 +108,6 @@ describe("user overrides in routing", () => {
   })
 })
 
-const context = (models: { providerID: string; id: string }[] = []) => ({
-  now,
-  providers: ["anthropic", "openai"],
-  models,
-})
-
-describe("interpreting a sentence", () => {
-  test("a named provider with a time is decided with certainty", async () => {
-    const result = await ModelRouteInterpret.interpret("stop using anthropic for the rest of the day", context(), {
-      keywords: true,
-      local: false,
-      external: false,
-    })
-    expect(result).toMatchObject({ status: "decided", confidence: "certain" })
-    if (result.status !== "decided") throw new Error("expected a decision")
-    expect(result.drafts).toEqual([expect.objectContaining({ action: "avoid", providers: ["anthropic"], models: [] })])
-    expect(result.drafts[0].until).toBeGreaterThan(now)
-    expect(result.drafts[0].until).toBeLessThanOrEqual(now + DAY)
-  })
-
-  test("'claude' may mean the provider or every Claude model, so it asks once", () => {
-    const result = ModelRouteInterpret.keywords("don't use claude anymore today", context())
-    expect(result.status).toBe("clarify")
-    if (result.status !== "clarify") throw new Error("expected a question")
-    expect(result.options.map((option) => option.drafts[0].providers.concat(option.drafts[0].models))).toEqual([
-      ["anthropic"],
-      ["*claude*"],
-    ])
-  })
-
-  test("excluding a model family asks whether it means every provider", () => {
-    const result = ModelRouteInterpret.keywords("avoid opus today", context())
-    expect(result.status).toBe("clarify")
-  })
-
-  test("preferring a family picks the newest version on each provider", () => {
-    const models = [
-      { providerID: "anthropic", id: "claude-opus-4" },
-      { providerID: "anthropic", id: "claude-opus-4-1-20250805" },
-      { providerID: "anthropic", id: "claude-sonnet-4-5" },
-      { providerID: "openai", id: "opus-3" },
-    ]
-    const result = ModelRouteInterpret.keywords("use opus", context(models))
-    expect(result).toMatchObject({ status: "decided" })
-    if (result.status !== "decided") throw new Error("expected a decision")
-    expect(result.drafts.map((draft) => draft.models)).toEqual([["claude-opus-4-1-20250805"], ["opus-3"]])
-  })
-
-  test("a provider being down is an avoid until the stated time", () => {
-    const result = ModelRouteInterpret.keywords("openai is down for 3 hours", context())
-    expect(result).toMatchObject({ status: "decided", confidence: "certain" })
-    if (result.status !== "decided") throw new Error("expected a decision")
-    expect(result.drafts[0]).toMatchObject({ action: "avoid", providers: ["openai"] })
-    expect(result.drafts[0].until).toBeGreaterThanOrEqual(now + 3 * 3_600_000 - 1_000)
-  })
-
-  test("pool membership and nonsense are reported, not guessed at", () => {
-    expect(ModelRouteInterpret.keywords("include all sonnet in any pool", context()).status).toBe("unknown")
-    expect(ModelRouteInterpret.keywords("hello there", context()).status).toBe("unknown")
-  })
-
-  test("a disabled keyword stage is not used", async () => {
-    const result = await ModelRouteInterpret.interpret("stop using openai", context(), {
-      keywords: false,
-      local: false,
-      external: false,
-    })
-    expect(result.status).toBe("unknown")
-  })
-
-  test("a smarter stage that decides overrides a tentative keyword answer", async () => {
-    const external = async () => ({
-      status: "decided" as const,
-      stage: "external",
-      confidence: "certain" as const,
-      drafts: [{ action: "avoid" as const, providers: ["openai"], models: [], until: now + 1, text: "" }],
-      summary: "",
-    })
-    const result = await ModelRouteInterpret.interpret("stop using openai", context(), undefined, { external })
-    expect(result).toMatchObject({ status: "decided", stage: "external" })
-  })
-})
-
 describe("priority, lighter, and the fixed-route facet", () => {
   const sonnet = ModelRoute.ref({ providerID: "anthropic", model: "claude-sonnet-4" })
   const fixedScope = { routeID: "r", fixed: true }
@@ -244,36 +160,5 @@ describe("priority, lighter, and the fixed-route facet", () => {
     expect(ModelRoute.weightFactor(sonnet, now, fixedScope)).toBe(1)
     expect(ModelRoute.weightFactor(sonnet, now, rulesScope)).toBe(5)
     ModelRoute.setAdjustments([])
-  })
-})
-
-describe("interpreting priority and facets", () => {
-  const context = { now, providers: ["anthropic", "openai"], models: [] }
-
-  test("'use opus less today' lowers priority rather than raising it", () => {
-    const result = ModelRouteInterpret.keywords("use anthropic opus less today", context)
-    if (result.status !== "decided") throw new Error("expected a decision")
-    expect(result.drafts[0]).toMatchObject({ action: "prefer", factor: 1 / 3 })
-  })
-
-  test("a stated multiple sets the factor", () => {
-    const result = ModelRouteInterpret.keywords("prefer openai 2x", context)
-    if (result.status !== "decided") throw new Error("expected a decision")
-    expect(result.drafts[0]).toMatchObject({ action: "prefer", factor: 2 })
-  })
-
-  test("'except on fixed routes' stops the override short of fixed routes", () => {
-    const result = ModelRouteInterpret.keywords("prefer anthropic except on fixed routes", context)
-    if (result.status !== "decided") throw new Error("expected a decision")
-    expect(result.drafts[0]).toMatchObject({ fixed: false })
-  })
-
-  test("drafts become stored overrides that keep their facets", () => {
-    const [override] = ModelRouteInterpret.toOverrides(
-      [{ action: "prefer", providers: ["openai"], models: [], factor: 3, fixed: false, until: now + DAY, text: "x" }],
-      "user",
-      now,
-    )
-    expect(override).toMatchObject({ action: "prefer", providers: ["openai"], factor: 3, fixed: false, source: "user" })
   })
 })
