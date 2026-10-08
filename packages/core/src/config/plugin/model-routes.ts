@@ -133,7 +133,7 @@ function configuredRoutes(entries: readonly Entry[]) {
   return routes
 }
 
-function expand(
+export function expand(
   id: string,
   routes: ReadonlyMap<string, ConfigModelRoutes.Route>,
   definitions: ReadonlyMap<Provider.ID, ReadonlyMap<string, Model.Info>>,
@@ -178,51 +178,69 @@ function expand(
         if (child !== undefined) attach({ node: child }, `${ModelRoute.PROVIDER_ID}/${ref.id}`)
         continue
       }
-      const model = definitions.get(ref.providerID)?.get(ref.id)
-      if (!model || !model.enabled) continue
-      const variant = ref.variant ?? inheritedVariant
-      if (variant && !model.variants.some((item) => item.id === variant)) continue
-      const resolved = Model.Ref.make({
-        providerID: ref.providerID,
-        id: ref.id,
-        ...(variant ? { variant } : {}),
-      })
-      const key = `${resolved.providerID}/${resolved.id}${resolved.variant ? `#${resolved.variant}` : ""}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      const defaultVariant =
-        spec.defaultVariant && model.variants.some((item) => item.id === spec.defaultVariant)
-          ? Model.VariantID.make(spec.defaultVariant)
-          : undefined
-      const variantMap = Object.fromEntries(
-        Object.entries(spec.variants ?? {}).flatMap(([from, to]) =>
-          model.variants.some((item) => item.id === to) ? [[from, Model.VariantID.make(to)] as const] : [],
-        ),
-      )
-      const leafKey = `${resolved.providerID}/${resolved.id}`
-      attach({ leaf: result.length }, leafKey)
-      // Budgets belong to the target: the outermost route that declares one wins, wherever the
-      // target was first reached.
-      const budget = plainBudget(
-        [...nextTrail]
-          .filter((id) => ModelRouteAutonomy.usesRules(routes.get(id)?.autonomy))
-          .map((id) => routes.get(id)?.budgets?.[leafKey])
-          .find((value) => value !== undefined),
-      )
-      result.push({
-        ...(budget ? { budget } : {}),
-        ref: resolved,
-        model,
-        fixedVariant: ref.variant !== undefined || inheritedVariant !== undefined,
-        ...(defaultVariant ? { defaultVariant } : {}),
-        ...(Object.keys(variantMap).length ? { variantMap } : {}),
-      })
+      if (spec.until !== undefined && Date.now() >= spec.until) continue
+      for (const [id, model] of matchingModels(ref.id, definitions.get(ref.providerID))) {
+        if (!model.enabled) continue
+        const variant = ref.variant ?? inheritedVariant
+        if (variant && !model.variants.some((item) => item.id === variant)) continue
+        const resolved = Model.Ref.make({
+          providerID: ref.providerID,
+          id,
+          ...(variant ? { variant } : {}),
+        })
+        const key = `${resolved.providerID}/${resolved.id}${resolved.variant ? `#${resolved.variant}` : ""}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        const defaultVariant =
+          spec.defaultVariant && model.variants.some((item) => item.id === spec.defaultVariant)
+            ? Model.VariantID.make(spec.defaultVariant)
+            : undefined
+        const variantMap = Object.fromEntries(
+          Object.entries(spec.variants ?? {}).flatMap(([from, to]) =>
+            model.variants.some((item) => item.id === to) ? [[from, Model.VariantID.make(to)] as const] : [],
+          ),
+        )
+        const leafKey = `${resolved.providerID}/${resolved.id}`
+        attach({ leaf: result.length }, leafKey)
+        // Budgets belong to the target: the outermost route that declares one wins, wherever the
+        // target was first reached.
+        const budget = plainBudget(
+          [...nextTrail]
+            .filter((id) => ModelRouteAutonomy.usesRules(routes.get(id)?.autonomy))
+            .map((id) => routes.get(id)?.budgets?.[leafKey])
+            .find((value) => value !== undefined),
+        )
+        result.push({
+          ...(budget ? { budget } : {}),
+          ref: resolved,
+          model,
+          fixedVariant: ref.variant !== undefined || inheritedVariant !== undefined,
+          ...(defaultVariant ? { defaultVariant } : {}),
+          ...(Object.keys(variantMap).length ? { variantMap } : {}),
+        })
+      }
     }
     return node.children.length > 0 ? nodeIndex : undefined
   }
 
   visit(id, undefined, new Set())
   return { leaves: result, nodes }
+}
+
+/** A model id, or every model of the provider whose id matches a `*` pattern, in the provider's order. */
+function matchingModels(pattern: string, models: ReadonlyMap<string, Model.Info> | undefined) {
+  if (!models) return []
+  if (!pattern.includes("*")) {
+    const model = models.get(pattern)
+    return model ? [[Model.ID.make(pattern), model] as const] : []
+  }
+  const matcher = new RegExp(
+    `^${pattern
+      .split("*")
+      .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*")}$`,
+  )
+  return [...models].filter(([id]) => matcher.test(id)).map(([id, model]) => [Model.ID.make(id), model] as const)
 }
 
 /** Settings are stored as JSON, which has no undefined: keep only the allowances actually set. */

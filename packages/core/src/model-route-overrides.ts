@@ -154,15 +154,3 @@ export const remove = (id: string, now = Date.now()) =>
     current().filter((item) => item.id !== id),
     now,
   )
-
-/** Appends one interpretation and the user's response to it, so tendencies can be learned from it. */
-export const recordFeedback = (entry: {
-  readonly text: string
-  readonly interpretation: unknown
-  readonly accepted: boolean | "corrected"
-  readonly time?: number
-}) => {
-  const file = path.join(path.dirname(filePath()), "route-feedback.jsonl")
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.appendFileSync(file, `${JSON.stringify({ time: Date.now(), ...entry })}\n`)
-}

@@ -21,6 +21,10 @@ const TargetObject = Schema.Struct({
     description:
       'Remaps a route-level variant to this target\'s variant, e.g. { "low": "high" } runs this target at high when the route is selected at low.',
   }),
+  until: PositiveInt.pipe(optional).annotate({
+    description:
+      "Epoch milliseconds after which this target leaves the route. Used for time-limited pool membership; takes effect when the configuration reloads.",
+  }),
 })
 export const Target = Schema.Union([ConfigModel.Selection, TargetObject]).annotate({
   identifier: "Config.ModelRoute.Target",
