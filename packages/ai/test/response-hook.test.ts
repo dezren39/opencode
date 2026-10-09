@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Stream } from "effect"
-import { Headers } from "effect/unstable/http"
+import { Headers } from "effect/http"
 import { HttpContext, LLM } from "../src/index.js"
 import { LLMClient, RequestExecutor, WebSocketTransport } from "../src/route.js"
 import { configure } from "../src/providers/openai.js"
