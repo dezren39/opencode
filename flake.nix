@@ -40,6 +40,7 @@
           rec {
             opencode = final.callPackage ./nix/opencode.nix {
               inherit node_modules;
+              mcpx = final.mcpx or null;
             };
             opencode-desktop = final.callPackage ./nix/desktop.nix {
               inherit opencode;
@@ -58,6 +59,7 @@
           default = opencode;
           opencode = pkgs.callPackage ./nix/opencode.nix {
             inherit node_modules;
+            mcpx = pkgs.mcpx or null;
           };
           opencode-desktop = pkgs.callPackage ./nix/desktop.nix {
             inherit opencode;

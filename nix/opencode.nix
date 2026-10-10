@@ -13,6 +13,7 @@
   versionCheckHook,
   writableTmpDirAsHomeHook,
   node_modules ? callPackage ./node_modules.nix { },
+  mcpx ? null,
 }:
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "opencode";
@@ -72,12 +73,17 @@ stdenvNoCC.mkDerivation (finalAttrs: {
           [
             ripgrep
           ]
+          ++ lib.optional (mcpx != null) mcpx
           # bun runs sysctl to detect if running on rosetta2
           ++ lib.optional stdenvNoCC.hostPlatform.isDarwin sysctl
         )
       } ${lib.optionalString stdenvNoCC.hostPlatform.isLinux ''
         --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ wayland ]}
       ''}
+
+    ${lib.optionalString (mcpx != null) ''
+      ln -s ${mcpx}/bin/mcpx $out/bin/mcpx
+    ''}
 
     ln -s opencode $out/bin/opencode2
 
