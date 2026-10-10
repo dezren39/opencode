@@ -172,3 +172,37 @@ describe("Feature 5: Just-in-Time Secret Prompting", () => {
     expect(lastHeaders["x-mcpx-secret-openai_api_key"]).toBe("sk-test-secret-12345")
   })
 })
+
+describe("Feature 2: TTL and Script Auto-Projection", () => {
+  it("decrements turn TTL and auto-retracts expired tools", () => {
+    clearProjectedTools()
+    const removed: string[] = []
+    const mockEditor: any = {
+      add: () => {},
+      remove: (id: string) => removed.push(id),
+    }
+
+    const { stepTurnTtl } = require("../src/tool/plugin/mcpx-projection.js")
+    const { getProjectedTools } = require("../src/tool/plugin/mcpx-projection.js")
+
+    // Manually register a projected tool with ttl = 2
+    getProjectedTools().set("test_tool", {
+      id: "test_tool",
+      namespace: "test",
+      toolName: "tool",
+      originalTool: {},
+      ttlRemaining: 2,
+    })
+
+    // Turn 1 step: ttl becomes 1
+    const expired1 = stepTurnTtl(mockEditor)
+    expect(expired1.length).toBe(0)
+    expect(getProjectedTools().has("test_tool")).toBe(true)
+
+    // Turn 2 step: ttl becomes 0 -> retracted!
+    const expired2 = stepTurnTtl(mockEditor)
+    expect(expired2).toContain("test_tool")
+    expect(getProjectedTools().has("test_tool")).toBe(false)
+    expect(removed).toContain("test_tool")
+  })
+})

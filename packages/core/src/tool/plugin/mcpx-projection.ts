@@ -11,6 +11,7 @@ export interface ProjectedToolRecord {
   readonly namespace: string
   readonly toolName: string
   readonly originalTool: any
+  ttlRemaining?: number // turns remaining before auto-retract
 }
 
 // Active projected tools by tool ID / name
@@ -50,6 +51,81 @@ export const retractTools = (namesOrNamespaces: string[], editor?: Editor): stri
     }
   }
   return removed
+}
+
+/**
+ * Decrements TTL for all projected tools that have a finite turn limit,
+ * automatically retracting any that have expired.
+ */
+export const stepTurnTtl = (editor?: Editor): string[] => {
+  const expired: string[] = []
+  for (const [id, record] of projectedTools.entries()) {
+    if (typeof record.ttlRemaining === "number") {
+      record.ttlRemaining -= 1
+      if (record.ttlRemaining <= 0) {
+        if (editor) {
+          try {
+            editor.remove(id)
+          } catch {}
+        }
+        projectedTools.delete(id)
+        expired.push(id)
+      }
+    }
+  }
+  return expired
+}
+
+/**
+ * Parses script source for calls to tools.<namespace>.<tool>(...)
+ */
+export const extractToolsFromScript = (source: string): Array<{ namespace: string; tool: string }> => {
+  const results: Array<{ namespace: string; tool: string }> = []
+  const seen = new Set<string>()
+
+  // Matches tools.namespace.tool or tools["namespace"]["tool"] or tools['namespace'].tool
+  const regex = /tools(?:\.([a-zA-Z0-9_-]+)|\[["']([^"']+)["']\])(?:\.([a-zA-Z0-9_-]+)|\[["']([^"']+)["']\])/g
+  let match: RegExpExecArray | null
+
+  while ((match = regex.exec(source)) !== null) {
+    const ns = match[1] || match[2]
+    const tool = match[3] || match[4]
+    if (ns && tool) {
+      const key = `${ns}_${tool}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        results.push({ namespace: ns, tool })
+      }
+    }
+  }
+
+  return results
+}
+
+/**
+ * Automatically projects tools discovered in an executed script with a default TTL (default: 3 turns).
+ */
+export const autoProjectFromScript = async (options: {
+  source: string
+  callDaemon: (path: string, method?: string, body?: any, headers?: Record<string, string>) => Promise<any>
+  editor: Editor
+  defaultTtl?: number
+}): Promise<string[]> => {
+  const extracted = extractToolsFromScript(options.source)
+  if (extracted.length === 0) return []
+
+  const toolNames = extracted.map((e) => e.tool)
+  const namespaces = Array.from(new Set(extracted.map((e) => e.namespace)))
+
+  const { added } = await projectTools({
+    namespaces,
+    tools: toolNames,
+    callDaemon: options.callDaemon,
+    editor: options.editor,
+    ttl: options.defaultTtl ?? 3,
+  })
+
+  return added
 }
 
 /**
@@ -101,6 +177,7 @@ export const projectTools = async (
   options: {
     namespaces?: string[]
     tools?: string[]
+    ttl?: number
     callDaemon: (path: string, method?: string, body?: any, headers?: Record<string, string>) => Promise<any>
     editor: Editor
   },
@@ -131,8 +208,12 @@ export const projectTools = async (
         continue
       }
 
-      // Check if already projected
+      // If already projected, refresh TTL if specified
       if (projectedTools.has(fullName)) {
+        if (typeof options.ttl === "number") {
+          const existing = projectedTools.get(fullName)
+          if (existing) existing.ttlRemaining = options.ttl
+        }
         continue
       }
 
@@ -189,6 +270,7 @@ export const projectTools = async (
           namespace: ns,
           toolName,
           originalTool: item,
+          ttlRemaining: options.ttl,
         })
         added.push(fullName)
       } catch (addErr: any) {

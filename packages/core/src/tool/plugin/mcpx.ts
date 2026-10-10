@@ -12,7 +12,7 @@ import { McpxSubagent } from "./mcpx-subagent.js"
 export * as McpxSubagent from "./mcpx-subagent.js"
 import { McpxDiagnose, interceptToolDiagnostic } from "./mcpx-diagnose.js"
 export * as McpxDiagnose from "./mcpx-diagnose.js"
-import { McpxProjection, projectTools, retractTools } from "./mcpx-projection.js"
+import { McpxProjection, projectTools, retractTools, autoProjectFromScript, stepTurnTtl } from "./mcpx-projection.js"
 export * as McpxProjection from "./mcpx-projection.js"
 import { McpxSecrets, callWithSecretPrompt } from "./mcpx-secrets.js"
 export * as McpxSecrets from "./mcpx-secrets.js"
@@ -174,6 +174,13 @@ export const Plugin = {
     // Intercept tool errors for mcpx_exec and projected MCP tools
     yield* Effect.sync(() => {
       try {
+        ctx.tool.hook("execute.before", () =>
+          Effect.sync(() => {
+            stepTurnTtl()
+          }),
+        )
+      } catch {}
+      try {
         ctx.tool.hook("execute.after", (event) =>
           interceptToolDiagnostic(event, {
             callDaemon,
@@ -215,6 +222,17 @@ export const Plugin = {
                 })
               }
               const output = res.output ?? JSON.stringify(res.result ?? res, null, 2)
+              // Auto-project tools used in script with a 3-turn TTL for subsequent review
+              try {
+                yield* Effect.promise(() =>
+                  autoProjectFromScript({
+                    source: input.source,
+                    callDaemon,
+                    editor,
+                    defaultTtl: 3,
+                  }),
+                )
+              } catch {}
               return { output: { output: String(output) } }
             } catch {
               const env: Record<string, string> = {}
@@ -223,6 +241,16 @@ export const Plugin = {
               const out = yield* Effect.tryPromise(() => runCli(["exec", input.source], env)).pipe(
                 Effect.mapError((err: any) => new ToolFailure({ message: err.message, error: err })),
               )
+              try {
+                yield* Effect.promise(() =>
+                  autoProjectFromScript({
+                    source: input.source,
+                    callDaemon,
+                    editor,
+                    defaultTtl: 3,
+                  }),
+                )
+              } catch {}
               return { output: { output: String(out) } }
             }
           }),
@@ -315,7 +343,8 @@ export const Plugin = {
           "Dynamically project tools from specified mcpx namespaces directly into the tool registry for this session. Projected tools become available immediately as top-level tools named <namespace>_<tool>.",
         input: Schema.Struct({
           namespaces: Schema.optionalKey(Schema.Array(Schema.String).annotate({ description: "Namespaces to project tools from (e.g. ['neon', 'chrome_devtools'])" })),
-          tools: Schema.optionalKey(Schema.Array(Schema.String).annotate({ description: "Specific tool names to project" })),
+          tools: Schema.optionalKey(Schema.Array(Schema.String).annotate({ description: "Specific tool names to project (e.g. ['click', 'take_screenshot'])" })),
+          ttl: Schema.optionalKey(Schema.Number.annotate({ description: "Optional number of turns this projection should remain active before auto-retracting (default: persistent until retracted)" })),
         }),
         output: Schema.Struct({
           output: Schema.String,
@@ -327,14 +356,15 @@ export const Plugin = {
               projectTools({
                 namespaces: input.namespaces,
                 tools: input.tools,
+                ttl: input.ttl,
                 callDaemon,
                 editor,
               }),
             ).pipe(Effect.mapError((err: any) => new ToolFailure({ message: err?.message || String(err), error: err })))
 
             const msg = `Projected ${result.added.length} tool(s): ${result.added.join(", ") || "none"}.${
-              result.errors.length > 0 ? " Errors: " + result.errors.join("; ") : ""
-            }`
+              typeof input.ttl === "number" ? ` (TTL: ${input.ttl} turns)` : ""
+            }${result.errors.length > 0 ? " Errors: " + result.errors.join("; ") : ""}`
             return {
               output: {
                 output: msg,
