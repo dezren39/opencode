@@ -3,7 +3,7 @@ export * as McpxTool from "./mcpx.js"
 import { ToolFailure } from "@opencode/ai"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Effect, Schema } from "effect"
-import { execFile } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -13,8 +13,8 @@ export const name = "mcpx"
 const defaultSocketPath = (): string => {
   if (process.env.MCPX_SOCKET) return process.env.MCPX_SOCKET
   const stateDir = process.env.MCPX_STATE_DIR ||
-    process.env.XDG_STATE_HOME ? join(process.env.XDG_STATE_HOME!, "mcpx") :
-    join(homedir(), ".local", "state", "mcpx")
+    (process.env.XDG_STATE_HOME ? join(process.env.XDG_STATE_HOME!, "mcpx") :
+    join(homedir(), ".local", "state", "mcpx"))
   return join(stateDir, "daemon.sock")
 }
 
@@ -78,9 +78,60 @@ const callDaemon = async (path: string, method = "GET", body?: any): Promise<any
   throw new Error("No mcpx daemon reachable")
 }
 
+let daemonEnsured = false
+
+/**
+ * Ensures mcpx daemon is standing and up-to-date.
+ * Decoupled lifecycle:
+ * - If daemon is not running, spawn detached in the background (`unref()`).
+ *   OpenCode shutting down or reloading will not terminate the mcpx daemon.
+ * - If daemon is already running, check if reload is needed or notify it.
+ */
+const ensureDaemon = async (): Promise<void> => {
+  if (daemonEnsured) return
+  try {
+    const health = await callDaemon("/v1/health")
+    if (health?.status === "ok") {
+      // Daemon is standing; trigger seamless hot reload so any updated config or binary is active
+      try {
+        await callDaemon("/v1/reload", "POST")
+      } catch {}
+      daemonEnsured = true
+      return
+    }
+  } catch {}
+
+  // Daemon not reachable; spawn detached so it outlives opencode
+  try {
+    const child = spawn("mcpx", ["daemon"], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    })
+    child.unref()
+
+    // Give daemon up to 1.5s to answer /v1/health
+    const deadline = Date.now() + 1500
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100))
+      try {
+        const health = await callDaemon("/v1/health")
+        if (health?.status === "ok") {
+          daemonEnsured = true
+          return
+        }
+      } catch {}
+    }
+  } catch {}
+  daemonEnsured = true
+}
+
 export const Plugin = {
   id: "opencode.tools.mcpx",
   effect: Effect.fn("McpxTool.Plugin")(function* (ctx: Context) {
+    // Opportunistically ensure daemon is standing detached in background
+    yield* Effect.promise(() => ensureDaemon())
+
     // Inject session leasing into shell commands
     yield* ctx.shell.hook("create.before", (invocation: any) =>
       Effect.sync(() => {
