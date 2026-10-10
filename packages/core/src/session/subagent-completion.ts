@@ -4,6 +4,7 @@ import { Effect } from "effect"
 import type { Job } from "../job.js"
 import type { Session } from "../session.js"
 import type { SessionMessage } from "./message.js"
+import { McpxSubagent } from "../tool/plugin/mcpx-subagent.js"
 
 export const NO_TEXT = "Subagent completed without a text response."
 
@@ -42,5 +43,6 @@ export const deliver = Effect.fnUntraced(function* (
     text: `<subagent sessionID="${recovery.childSessionID}" state="${input.status}" description="${recovery.description}">\n${text}\n</subagent>`,
     metadata: { source: "subagent", childID: recovery.childSessionID, agent: recovery.agent, state: input.status },
   })
+  yield* McpxSubagent.releaseSubagentSession(recovery.childSessionID).pipe(Effect.catchAll(() => Effect.void))
   if (input.notificationID) yield* jobs.completeBackground(input.notificationID)
 })

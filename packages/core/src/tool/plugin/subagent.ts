@@ -13,6 +13,7 @@ import { Session } from "../../session.js"
 import { SessionSchema } from "../../session/schema.js"
 import { SubagentCompletion } from "../../session/subagent-completion.js"
 import { SubagentJob } from "../../session/subagent-job.js"
+import { McpxSubagent } from "./mcpx-subagent.js"
 
 export const name = "subagent"
 
@@ -197,6 +198,11 @@ export const Plugin = {
                     ),
                   ))
 
+              yield* McpxSubagent.initializeSubagentSession({
+                parentSessionID: context.sessionID,
+                childID: child.id,
+              }).pipe(Effect.catchAll(() => Effect.void))
+
               const background = input.background === true
               yield* context.progress({ sessionID: child.id, status: "running" })
 
@@ -233,15 +239,23 @@ export const Plugin = {
 
               const result = yield* jobs.block({ id: child.id, sessionID: context.sessionID }).pipe(
                 Effect.onInterrupt(() =>
-                  Effect.all([sessions.interrupt(child.id), jobs.cancel(child.id)], {
-                    discard: true,
-                  }),
+                  Effect.all(
+                    [
+                      sessions.interrupt(child.id),
+                      jobs.cancel(child.id),
+                      McpxSubagent.releaseSubagentSession(child.id).pipe(Effect.catchAll(() => Effect.void)),
+                    ],
+                    {
+                      discard: true,
+                    },
+                  ),
                 ),
               )
               if (result?.type === "backgrounded") {
                 yield* subagents.notify(recovery, result.info.started_at)
                 return backgroundResult(child.id)
               }
+              yield* McpxSubagent.releaseSubagentSession(child.id).pipe(Effect.catchAll(() => Effect.void))
               // Failure surfaces keep the sessionID visible so the model can continue the child.
               if (result?.info.status === "error")
                 return yield* new ToolFailure({

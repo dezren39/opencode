@@ -65,6 +65,7 @@ import { Job } from "./job.js"
 import type { Command } from "./command.js"
 import { SessionEnvironment } from "./session/environment.js"
 import { InstructionEntry } from "./session/instruction-entry.js"
+import { McpxSubagent } from "./tool/plugin/mcpx-subagent.js"
 
 // get project -> project.locations
 //
@@ -313,6 +314,13 @@ const layer = Layer.effect(
             }),
           )
         if (projected.type === "existing") return projected.session
+        if (input.parentID) {
+          yield* McpxSubagent.initializeSubagentSession({
+            parentSessionID: input.parentID,
+            childID: sessionID,
+            environments,
+          }).pipe(Effect.catchAll(() => Effect.void))
+        }
         // TODO: Restore recorded sessions onto replacement synchronized workspaces in a future API slice.
         return yield* result.get(sessionID).pipe(Effect.orDie)
       }),
@@ -371,6 +379,7 @@ const layer = Layer.effect(
         yield* transport.close(sessionID)
         const children = yield* result.list({ parentID: sessionID })
         yield* Effect.forEach(children.data, (child) => result.remove(child.id), { concurrency: 1, discard: true })
+        yield* McpxSubagent.releaseSubagentSession(sessionID).pipe(Effect.catchAll(() => Effect.void))
         yield* environments.clear(sessionID)
         yield* bus.publish(SessionEvent.Deleted, { sessionID })
         yield* bus.remove(sessionID)

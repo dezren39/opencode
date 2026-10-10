@@ -120,6 +120,8 @@ describe("McpxTool", () => {
           expect(names).toContain("mcpx_exec")
           expect(names).toContain("mcpx_discover")
           expect(names).toContain("mcpx_observe")
+          expect(names).toContain("mcpx_project")
+          expect(names).toContain("mcpx_retract")
         }),
       )
     }),
