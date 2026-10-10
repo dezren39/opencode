@@ -80,6 +80,7 @@ import { ReadToolFileSystem } from "../tool/read-filesystem.js"
 import { ReadTool } from "../tool/plugin/read.js"
 import { PersistentPty } from "../persistent-pty.js"
 import { PtyTool } from "../tool/plugin/pty.js"
+import { McpxTool } from "../tool/plugin/mcpx.js"
 import { ShellTool } from "../tool/plugin/shell.js"
 import { SkillTool } from "../tool/plugin/skill.js"
 import { SubagentTool } from "../tool/plugin/subagent.js"
@@ -247,6 +248,7 @@ const pre = [
   ReadTool.Plugin,
   ShellTool.Plugin,
   PtyTool.Plugin,
+  McpxTool.Plugin,
   SkillTool.Plugin,
   SubagentTool.Plugin,
   WebFetchTool.Plugin,
