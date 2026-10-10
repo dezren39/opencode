@@ -78,6 +78,8 @@ import { OpenCodeTools } from "../tool/plugin/opencode.js"
 import { QuestionTool } from "../tool/plugin/question.js"
 import { ReadToolFileSystem } from "../tool/read-filesystem.js"
 import { ReadTool } from "../tool/plugin/read.js"
+import { PersistentPty } from "../persistent-pty.js"
+import { PtyTool } from "../tool/plugin/pty.js"
 import { ShellTool } from "../tool/plugin/shell.js"
 import { SkillTool } from "../tool/plugin/skill.js"
 import { SubagentTool } from "../tool/plugin/subagent.js"
@@ -147,6 +149,7 @@ const services = [
   SubagentJob.Service,
   Shell.Service,
   ShellSelect.Service,
+  PersistentPty.Service,
   Snapshot.Service,
   Skill.Service,
   SkillDiscovery.Service,
@@ -201,6 +204,7 @@ export const requirements = LayerNode.group([
   SubagentJob.node,
   Shell.node,
   ShellSelect.node,
+  PersistentPty.node,
   Snapshot.node,
   Skill.node,
   SkillDiscovery.node,
@@ -242,6 +246,7 @@ const pre = [
   QuestionTool.Plugin,
   ReadTool.Plugin,
   ShellTool.Plugin,
+  PtyTool.Plugin,
   SkillTool.Plugin,
   SubagentTool.Plugin,
   WebFetchTool.Plugin,
